@@ -38,21 +38,20 @@ parse_msdial_export <- function(filepath) {
   # Read all data as text to preserve structure
   # Row 1: Class, Row 2: File type, Row 3: Injection order, Row 4: Batch ID
   # Row 5: Column names, Row 6+: Data
+  #
+  # IMPORTANT: read_excel with n_max drops columns that are entirely NA,
+  # so we must read the full file at once to preserve column alignment.
 
-  # Read header rows (rows 1-4) with no col_names
-  header_raw <- read_excel(filepath, sheet = 1, col_names = FALSE,
-                           n_max = 4, .name_repair = "minimal")
-  header_raw <- as.data.frame(header_raw)
+  # Read first 5 rows to get headers (include row 5 = column names)
+  header_block <- read_excel(filepath, sheet = 1, col_names = FALSE,
+                             n_max = 5, .name_repair = "minimal")
+  header_block <- as.data.frame(header_block)
+  total_cols <- ncol(header_block)
 
-  # Row 1 = Class info
-  class_row <- as.character(header_raw[1, ])
-  # Row 4 = Batch ID (used to detect summary columns: "Average"/"Stdev")
-  batch_row <- as.character(header_raw[4, ])
-
-  # Read column names from row 5
-  col_names_raw <- read_excel(filepath, sheet = 1, col_names = FALSE,
-                              skip = 4, n_max = 1, .name_repair = "minimal")
-  col_names <- as.character(col_names_raw[1, ])
+  # Extract header rows
+  class_row <- as.character(header_block[1, ])   # Row 1: Class
+  batch_row <- as.character(header_block[4, ])   # Row 4: Batch ID
+  col_names <- as.character(header_block[5, ])   # Row 5: Column names
 
   # Find the boundary: "Class" in row 1 marks the start of sample info
   class_label_idx <- which(class_row == "Class")
@@ -67,7 +66,7 @@ parse_msdial_export <- function(filepath) {
   if (length(summary_idx) > 0) {
     data_end <- min(summary_idx) - 1
   } else {
-    data_end <- length(col_names)
+    data_end <- total_cols
   }
 
   # Sample column indices
@@ -79,7 +78,6 @@ parse_msdial_export <- function(filepath) {
   cat(sprintf("  Summary columns excluded: %d cols\n", length(summary_idx)))
 
   # Read the actual data (skip 5 header rows)
-  # Specify column types: metadata as text, samples as numeric
   data_raw <- read_excel(filepath, sheet = 1, col_names = FALSE,
                          skip = 5, .name_repair = "minimal")
   data_raw <- as.data.frame(data_raw)
@@ -154,14 +152,24 @@ match_samples <- function(col_names, class_info, grouping_df) {
     }
   }
 
-  # For unmatched columns, use class_info if available
+  # For unmatched columns, use class_info from Row 1 as fallback
   unmatched <- is.na(result$group)
   if (any(unmatched)) {
-    # Test and NA columns stay unmatched
-    cat(sprintf("  Unmatched columns: %d (will be excluded if Test/NA)\n",
-                sum(unmatched)))
-    cat(sprintf("  Unmatched classes: %s\n",
-                paste(unique(result$class[unmatched]), collapse = ", ")))
+    valid_classes <- c("0-mo", "6-mo", "12-mo", "QC", "Blank")
+    for (i in which(unmatched)) {
+      cls <- result$class[i]
+      if (!is.na(cls) && cls %in% valid_classes) {
+        result$group[i] <- ifelse(cls == "12-mo", "6-mo", cls)
+        result$sample_name[i] <- result$col_name[i]
+        cat(sprintf("  Fallback: %s assigned to group '%s' via Class info\n",
+                    result$col_name[i], result$group[i]))
+      }
+    }
+    still_unmatched <- is.na(result$group)
+    if (any(still_unmatched)) {
+      cat(sprintf("  Unmatched columns: %d (Test/NA, will be excluded)\n",
+                  sum(still_unmatched)))
+    }
   }
 
   result
