@@ -11,6 +11,7 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(ggrepel)
   library(patchwork)
+  library(pls)
 })
 
 # Color palette (colorblind-friendly)
@@ -368,4 +369,320 @@ plot_rsd_histogram <- function(rsd_values, rsd_threshold, output_path) {
   cat(sprintf("  Saved: %s\n", output_path))
 
   invisible(p)
+}
+
+
+# ============================================================
+# Phase 2/3 Functions
+# ============================================================
+
+# ----------------------------------------------------------
+# Data normalization: sum-norm -> log2 -> Pareto scaling
+# Returns list(normalized, log2_data, scaled)
+#   normalized: sum-normalized (for FC calculation reference)
+#   log2_data:  sum-normalized + log2 (for FC and univariate)
+#   scaled:     sum-normalized + log2 + Pareto (for PLS-DA)
+# ----------------------------------------------------------
+normalize_data <- function(intensity, sample_info) {
+  sample_groups <- c("0-mo", "6-mo")
+  sample_cols <- sample_info$col_name[sample_info$group %in% sample_groups]
+  mat <- as.matrix(intensity[, sample_cols, drop = FALSE])
+
+  # 1. Sum normalization (per sample = per column)
+  col_sums <- colSums(mat, na.rm = TRUE)
+  median_sum <- median(col_sums)
+  mat_norm <- sweep(mat, 2, col_sums, "/") * median_sum
+
+  # 2. Log2 transformation
+  mat_log2 <- log2(mat_norm)
+
+  # 3. Pareto scaling (per feature = per row): mean-center, divide by sqrt(SD)
+  row_means <- rowMeans(mat_log2, na.rm = TRUE)
+  row_sds <- apply(mat_log2, 1, sd, na.rm = TRUE)
+  row_sds[row_sds == 0] <- 1  # avoid division by zero
+  mat_scaled <- sweep(mat_log2, 1, row_means, "-")
+  mat_scaled <- sweep(mat_scaled, 1, sqrt(row_sds), "/")
+
+  groups <- sample_info$group[sample_info$group %in% sample_groups]
+
+  list(
+    normalized = mat_norm,
+    log2_data  = mat_log2,
+    scaled     = mat_scaled,
+    groups     = factor(groups, levels = c("0-mo", "6-mo")),
+    col_names  = sample_cols
+  )
+}
+
+
+# ----------------------------------------------------------
+# PLS-DA using pls::plsr with dummy Y
+# Returns list(model, scores, vip, r2, q2)
+# ----------------------------------------------------------
+run_plsda <- function(scaled_mat, groups, ncomp = 2) {
+  X <- t(scaled_mat)  # samples x features
+  Y <- ifelse(groups == "6-mo", 1, 0)
+
+  df <- data.frame(Y = I(matrix(Y, ncol = 1)), X = I(X))
+  model <- plsr(Y ~ X, data = df, ncomp = ncomp, validation = "LOO",
+                method = "oscorespls")
+
+  scores <- model$scores[, 1:ncomp, drop = FALSE]
+  colnames(scores) <- paste0("Comp", 1:ncomp)
+
+  # VIP calculation
+  vip <- compute_vip(model)
+
+  # R2 and Q2 from cross-validation
+  r2_vals <- R2(model)$val[1, 1, ]  # intercept + ncomp values
+  q2_vals <- 1 - MSEP(model)$val[1, 1, ] / var(Y)
+
+  list(
+    model  = model,
+    scores = scores,
+    vip    = vip,
+    R2     = r2_vals,
+    Q2     = q2_vals,
+    groups = groups
+  )
+}
+
+
+# ----------------------------------------------------------
+# VIP (Variable Importance in Projection) calculation
+# ----------------------------------------------------------
+compute_vip <- function(model) {
+  W <- model$loading.weights  # p x ncomp
+  T_mat <- model$scores       # n x ncomp
+  Q <- model$Yloadings        # 1 x ncomp
+
+  ncomp <- ncol(W)
+  p <- nrow(W)
+
+  # SS for each component
+  ss <- numeric(ncomp)
+  for (a in seq_len(ncomp)) {
+    ss[a] <- (t(T_mat[, a]) %*% T_mat[, a]) * (Q[1, a]^2)
+  }
+  ss_total <- sum(ss)
+
+  vip <- numeric(p)
+  for (j in seq_len(p)) {
+    weighted_sum <- sum(W[j, ]^2 * ss)
+    vip[j] <- sqrt(p * weighted_sum / ss_total)
+  }
+
+  vip
+}
+
+
+# ----------------------------------------------------------
+# PLS-DA permutation test
+# ----------------------------------------------------------
+run_permutation_test <- function(scaled_mat, groups, ncomp = 2,
+                                 n_perm = 1000) {
+  X <- t(scaled_mat)
+  Y <- ifelse(groups == "6-mo", 1, 0)
+
+  # Original model Q2
+  df <- data.frame(Y = I(matrix(Y, ncol = 1)), X = I(X))
+  orig_model <- plsr(Y ~ X, data = df, ncomp = ncomp, validation = "LOO",
+                     method = "oscorespls")
+  orig_q2 <- 1 - MSEP(orig_model)$val[1, 1, ncomp + 1] / var(Y)
+  orig_r2 <- R2(orig_model)$val[1, 1, ncomp + 1]
+
+  # Permutation
+  perm_q2 <- numeric(n_perm)
+  perm_r2 <- numeric(n_perm)
+  cor_vals <- numeric(n_perm)
+
+  for (i in seq_len(n_perm)) {
+    Y_perm <- sample(Y)
+    cor_vals[i] <- abs(cor(Y, Y_perm))
+    df_perm <- data.frame(Y = I(matrix(Y_perm, ncol = 1)), X = I(X))
+    perm_model <- tryCatch({
+      plsr(Y ~ X, data = df_perm, ncomp = ncomp, validation = "LOO",
+           method = "oscorespls")
+    }, error = function(e) NULL)
+
+    if (!is.null(perm_model)) {
+      perm_q2[i] <- 1 - MSEP(perm_model)$val[1, 1, ncomp + 1] / var(Y_perm)
+      perm_r2[i] <- R2(perm_model)$val[1, 1, ncomp + 1]
+    } else {
+      perm_q2[i] <- NA
+      perm_r2[i] <- NA
+    }
+  }
+
+  p_value <- mean(perm_q2 >= orig_q2, na.rm = TRUE)
+
+  list(
+    orig_r2  = orig_r2,
+    orig_q2  = orig_q2,
+    perm_r2  = perm_r2,
+    perm_q2  = perm_q2,
+    cor_vals = cor_vals,
+    p_value  = p_value
+  )
+}
+
+
+# ----------------------------------------------------------
+# PLS-DA score plot
+# ----------------------------------------------------------
+plot_plsda_scores <- function(plsda_result, title_suffix, output_path,
+                              paired_lines = FALSE, subject_ids = NULL) {
+  scores_df <- data.frame(
+    Comp1 = plsda_result$scores[, 1],
+    Comp2 = plsda_result$scores[, 2],
+    Group = plsda_result$groups
+  )
+
+  model <- plsda_result$model
+  xvar <- explvar(model)
+
+  p <- ggplot(scores_df, aes(x = Comp1, y = Comp2, color = Group)) +
+    stat_ellipse(level = 0.95, linetype = "dashed", linewidth = 0.5) +
+    geom_point(size = 3, alpha = 0.7) +
+    scale_color_manual(values = group_colors) +
+    labs(
+      x = sprintf("Component 1 (%.1f%%)", xvar[1]),
+      y = sprintf("Component 2 (%.1f%%)", xvar[2]),
+      title = paste("PLS-DA Score Plot —", title_suffix)
+    ) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+  # Add paired lines if requested
+  if (paired_lines && !is.null(subject_ids)) {
+    scores_df$Subject <- subject_ids
+    paired_df <- scores_df |>
+      select(Subject, Group, Comp1, Comp2) |>
+      pivot_wider(names_from = Group, values_from = c(Comp1, Comp2),
+                  names_sep = "_")
+    if (all(c("Comp1_0-mo", "Comp1_6-mo", "Comp2_0-mo", "Comp2_6-mo") %in%
+            colnames(paired_df))) {
+      p <- p + geom_segment(
+        data = paired_df,
+        aes(x = `Comp1_0-mo`, y = `Comp2_0-mo`,
+            xend = `Comp1_6-mo`, yend = `Comp2_6-mo`),
+        color = "grey60", linewidth = 0.3, alpha = 0.5,
+        inherit.aes = FALSE
+      )
+    }
+  }
+
+  pdf(output_path, width = 8, height = 6)
+  print(p)
+  dev.off()
+  cat(sprintf("  Saved: %s\n", output_path))
+  invisible(p)
+}
+
+
+# ----------------------------------------------------------
+# Permutation test plot
+# ----------------------------------------------------------
+plot_permutation <- function(perm_result, output_path) {
+  df <- data.frame(
+    Correlation = perm_result$cor_vals,
+    R2 = perm_result$perm_r2,
+    Q2 = perm_result$perm_q2
+  ) |>
+    pivot_longer(cols = c(R2, Q2), names_to = "Metric", values_to = "Value")
+
+  # Add original values
+  orig_df <- data.frame(
+    Correlation = c(1, 1),
+    Metric = c("R2", "Q2"),
+    Value = c(perm_result$orig_r2, perm_result$orig_q2)
+  )
+
+  p <- ggplot(df, aes(x = Correlation, y = Value, color = Metric)) +
+    geom_point(alpha = 0.3, size = 1) +
+    geom_point(data = orig_df, size = 4, shape = 18) +
+    geom_smooth(method = "lm", se = FALSE, linetype = "dashed", linewidth = 0.5) +
+    scale_color_manual(values = c("R2" = "#E64B35", "Q2" = "#4DBBD5")) +
+    labs(
+      x = "Correlation with Original Y",
+      y = "Value",
+      title = sprintf("Permutation Test (n=1000, p=%.4f)", perm_result$p_value)
+    ) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+  pdf(output_path, width = 8, height = 6)
+  print(p)
+  dev.off()
+  cat(sprintf("  Saved: %s\n", output_path))
+  invisible(p)
+}
+
+
+# ----------------------------------------------------------
+# Volcano plot
+# ----------------------------------------------------------
+plot_volcano <- function(stats_df, output_path, title_suffix = "All Samples") {
+  stats_df <- stats_df |>
+    mutate(
+      Significance = case_when(
+        FDR < 0.05 & log2FC > 1  ~ "Up in 6-mo",
+        FDR < 0.05 & log2FC < -1 ~ "Down in 6-mo",
+        TRUE ~ "Not significant"
+      )
+    )
+
+  volcano_colors <- c(
+    "Up in 6-mo"       = "#E64B35",
+    "Down in 6-mo"     = "#4DBBD5",
+    "Not significant"  = "grey70"
+  )
+
+  n_up <- sum(stats_df$Significance == "Up in 6-mo")
+  n_down <- sum(stats_df$Significance == "Down in 6-mo")
+
+  p <- ggplot(stats_df, aes(x = log2FC, y = -log10(FDR), color = Significance)) +
+    geom_point(size = 1.5, alpha = 0.7) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = volcano_colors) +
+    labs(
+      x = "log2(Fold Change) [6-mo / 0-mo]",
+      y = "-log10(FDR)",
+      title = paste("Volcano Plot —", title_suffix),
+      subtitle = sprintf("Up: %d | Down: %d", n_up, n_down)
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+
+  # Label top significant features
+  top_features <- stats_df |>
+    filter(Significance != "Not significant") |>
+    arrange(FDR) |>
+    head(15)
+
+  if (nrow(top_features) > 0) {
+    p <- p + geom_text_repel(
+      data = top_features,
+      aes(label = Metabolite_name),
+      size = 2.5, max.overlaps = 15, show.legend = FALSE
+    )
+  }
+
+  pdf(output_path, width = 8, height = 6)
+  print(p)
+  dev.off()
+  cat(sprintf("  Saved: %s\n", output_path))
+  invisible(p)
+}
+
+
+# ----------------------------------------------------------
+# Extract subject ID from sample name (number before underscore)
+# ----------------------------------------------------------
+extract_subject_id <- function(sample_name) {
+  as.integer(str_extract(sample_name, "^\\d+"))
 }
