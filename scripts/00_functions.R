@@ -424,7 +424,9 @@ run_plsda <- function(scaled_mat, groups, ncomp = 2) {
   Y <- ifelse(groups == "6-mo", 1, 0)
 
   df <- data.frame(Y = I(matrix(Y, ncol = 1)), X = I(X))
-  model <- plsr(Y ~ X, data = df, ncomp = ncomp, validation = "LOO",
+  cv_segments <- min(7, length(Y))
+  model <- plsr(Y ~ X, data = df, ncomp = ncomp,
+                validation = "CV", segments = cv_segments,
                 method = "oscorespls")
 
   scores <- model$scores[, 1:ncomp, drop = FALSE]
@@ -483,10 +485,15 @@ run_permutation_test <- function(scaled_mat, groups, ncomp = 2,
                                  n_perm = 1000) {
   X <- t(scaled_mat)
   Y <- ifelse(groups == "6-mo", 1, 0)
+  n <- length(Y)
+
+  # Use 7-fold CV (much faster than LOO for large datasets)
+  cv_segments <- min(7, n)
 
   # Original model Q2
   df <- data.frame(Y = I(matrix(Y, ncol = 1)), X = I(X))
-  orig_model <- plsr(Y ~ X, data = df, ncomp = ncomp, validation = "LOO",
+  orig_model <- plsr(Y ~ X, data = df, ncomp = ncomp,
+                     validation = "CV", segments = cv_segments,
                      method = "oscorespls")
   orig_q2 <- 1 - MSEP(orig_model)$val[1, 1, ncomp + 1] / var(Y)
   orig_r2 <- R2(orig_model)$val[1, 1, ncomp + 1]
@@ -501,7 +508,8 @@ run_permutation_test <- function(scaled_mat, groups, ncomp = 2,
     cor_vals[i] <- abs(cor(Y, Y_perm))
     df_perm <- data.frame(Y = I(matrix(Y_perm, ncol = 1)), X = I(X))
     perm_model <- tryCatch({
-      plsr(Y ~ X, data = df_perm, ncomp = ncomp, validation = "LOO",
+      plsr(Y ~ X, data = df_perm, ncomp = ncomp,
+           validation = "CV", segments = cv_segments,
            method = "oscorespls")
     }, error = function(e) NULL)
 
