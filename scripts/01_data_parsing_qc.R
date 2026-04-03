@@ -113,14 +113,14 @@ filtering_log <- rbind(filtering_log, data.frame(
 # ============================================================
 cat("\nStep 4: QC RSD filtering (raw intensity)...\n")
 
-rsd_result <- qc_rsd_filter(intensity, sample_info, rsd_threshold = 30)
+rsd_result <- qc_rsd_filter(intensity, sample_info, rsd_threshold = 60)
 rsd_values <- rsd_result$rsd
 keep_rsd <- rsd_result$keep
 
 # Plot RSD histogram BEFORE filtering (to show distribution)
 plot_rsd_histogram(
   rsd_values = rsd_values,
-  rsd_threshold = 30,
+  rsd_threshold = 60,
   output_path = file.path(output_dir, "02_qc_rsd_distribution.pdf")
 )
 

@@ -3,7 +3,7 @@
 # run_all_remaining.R — Run Phase 1/2/3 for Meta_Neg, Lip_Pos, Lip_Neg
 # ============================================================
 
-datasets <- c("Meta_Neg", "Lip_Pos", "Lip_Neg")
+datasets <- c("Meta_Pos", "Meta_Neg", "Lip_Pos", "Lip_Neg")
 
 for (ds in datasets) {
   cat("\n\n########################################################\n")
