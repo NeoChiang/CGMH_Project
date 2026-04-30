@@ -1,0 +1,110 @@
+```{r setup-paths, include=FALSE}
+# ─── Shared setup chunk, included by every pipeline Rmd via `child` ──────────
+# DO NOT render this file directly. It is loaded at the top of every
+# pipeline Rmd with:  child = "_setup.Rmd"
+
+# ── 1. Project base directory ────────────────────────────────────────────────
+#
+# EDIT THIS ONE LINE on a new machine.  Point it to the folder that
+# contains:   <base_dir>/Tsai CRC/2026 export/…
+#             <base_dir>/Tsai CRC/Tsai sample list.xlsx
+#             <base_dir>/Tsai CRC/CGMH_Biobank/GIMETB20171101_20221017_ES.xlsx
+#             <base_dir>/output/  (will be created automatically)
+#
+if (!exists("base_dir")) {
+  base_dir <- "C:/Users/Eric/ClaudeCowork_CRC_metabolomics"
+}
+
+paths <- list(
+  base        = base_dir,
+  data        = file.path(base_dir, "Tsai CRC", "2026 export"),
+  sample      = file.path(base_dir, "Tsai CRC", "Tsai sample list.xlsx"),
+  biobank_dir = file.path(base_dir, "Tsai CRC", "CGMH_Biobank"),
+  results     = file.path(base_dir, "output", "results"),
+  figures     = file.path(base_dir, "output", "figures"),
+  tables      = file.path(base_dir, "output", "tables")
+)
+
+for (d in c(paths$results, paths$figures, paths$tables)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+```
+
+```{r setup-libs, include=FALSE}
+# ── 2. User library path ─────────────────────────────────────────────────────
+# On Windows, user-installed packages typically live under:
+#   %USERPROFILE%\R\win-library\<R-version>
+# On Linux/macOS, Sys.getenv("USERPROFILE") is empty and the default
+# .libPaths() already points to the correct user library.
+user_lib <- file.path(Sys.getenv("USERPROFILE"), "R", "win-library",
+                      paste0(R.version$major, ".",
+                             strsplit(R.version$minor, "\\.")[[1]][1]))
+if (dir.exists(user_lib)) .libPaths(c(user_lib, .libPaths()))
+
+# ── 3. Knitr defaults ────────────────────────────────────────────────────────
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.align  = "center",
+  fig.width  = 8,
+  fig.height = 6,
+  dpi        = 150,
+  cache      = TRUE,
+  cache.lazy = FALSE,
+  comment    = "#>"
+)
+
+# ── 4. Packages ──────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+  library(knitr)
+})
+```
+
+```{r setup-helpers, include=FALSE}
+# ── 5. Shared helper functions (previously in utils.R) ───────────────────────
+
+#' Save a ggplot as both PDF and PNG in one call.
+save_fig <- function(plot, basename, dir = paths$figures,
+                     width = 10, height = 8, dpi = 200) {
+  ggsave(file.path(dir, paste0(basename, ".pdf")),
+         plot = plot, width = width, height = height)
+  ggsave(file.path(dir, paste0(basename, ".png")),
+         plot = plot, width = width, height = height, dpi = dpi)
+  invisible(file.path(dir, basename))
+}
+
+#' Row-wise relative standard deviation (%) over a features × samples matrix.
+#' Returns NA for rows with zero mean or all-NA values.
+calc_rsd <- function(mat) {
+  mu  <- rowMeans(mat, na.rm = TRUE)
+  sig <- apply(mat, 1, sd, na.rm = TRUE)
+  rsd <- (sig / mu) * 100
+  rsd[is.nan(rsd) | is.infinite(rsd)] <- NA
+  rsd
+}
+
+#' Row-median imputation for a features × samples matrix (vectorised).
+impute_row_median <- function(mat) {
+  row_meds <- apply(mat, 1, median, na.rm = TRUE)
+  na_idx   <- which(is.na(mat), arr.ind = TRUE)
+  if (nrow(na_idx) > 0) mat[na_idx] <- row_meds[na_idx[, 1]]
+  mat
+}
+
+#' D-ratio = SD(QC) / SD(biological) per feature. Values <0.5 indicate
+#' good analytical precision relative to biological variation.
+calc_dratio <- function(mat_qc, mat_bio) {
+  sd_qc  <- apply(mat_qc,  1, sd, na.rm = TRUE)
+  sd_bio <- apply(mat_bio, 1, sd, na.rm = TRUE)
+  d      <- sd_qc / sd_bio
+  d[is.nan(d) | is.infinite(d)] <- NA
+  d
+}
+```
