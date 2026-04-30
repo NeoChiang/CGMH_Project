@@ -1,0 +1,882 @@
+---
+title: "CRC Tissue Metabolomics — Part 3: Biological Interpretation & Translational Analyses"
+author: "Chang Gung Memorial Hospital — Metabolomics Medical Research Program"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+params:
+  base_dir: "C:/Users/Eric/ClaudeCowork_CRC_metabolomics"
+---
+
+```{r base-dir-from-params, include=FALSE}
+base_dir <- params$base_dir
+```
+
+```{r child = "_setup.Rmd"}
+```
+
+```{r extra-libs, include=FALSE}
+suppressPackageStartupMessages({
+  library(scales)
+  library(pheatmap)
+  library(ggrepel)
+  library(ropls)
+  library(pROC)
+})
+set.seed(42)
+```
+
+# Overview
+
+This document performs the biological interpretation and translational
+analyses of the statistical results produced by `02_statistics.Rmd`.
+
+| Step | Method | Output |
+|------|--------|--------|
+| 1. Pathway enrichment | Fisher's exact ORA over 19 curated CRC pathways | Table 3, Figure 6 |
+| 2. Colon sidedness | Right vs. Left tumour (within-tumour + paired FC) | Figures S1–S4 |
+| 3. ROC biomarker panel | Composite scoring + 10-fold CV logistic regression | Figure 8, biomarker table |
+
+**Inputs:**
+- `output/tables/Table2_differential_metabolites.csv`
+- `output/results/03_statistical_results.rds`
+- `output/tables/clinical_metadata_linked.csv`
+- `output/results/02b_batch_corrected_datasets.rds`
+
+**Expected render time: 5–10 min** — fastest Rmd; consumes pre-computed
+`.rds` files and runs Fisher tests, small OPLS-DA, and CV logistic regression.
+
+---
+
+# 1. Pathway Enrichment (ORA)
+
+## Load significant features and full universe
+
+```{r pathway-load}
+sig_df <- read.csv(file.path(paths$tables, "Table2_differential_metabolites.csv"),
+                   stringsAsFactors = FALSE)
+stat   <- readRDS(file.path(paths$results, "03_statistical_results.rds"))
+all_df <- stat$all_results
+
+clean_name <- function(x) str_replace(x, "^(low score|no MS2): ", "")
+all_df$clean_name <- clean_name(all_df$metabolite)
+sig_df$clean_name <- clean_name(sig_df$metabolite)
+
+all_named <- all_df %>% filter(metabolite != "Unknown", msi_level %in% c(2, 3))
+sig_named <- sig_df %>% filter(metabolite != "Unknown", msi_level %in% c(2, 3))
+
+cat(sprintf("Universe (named, MSI 2-3): %d (unique names: %d)\n",
+            nrow(all_named), n_distinct(all_named$clean_name)))
+cat(sprintf("Significant (named, MSI 2-3): %d (unique names: %d)\n",
+            nrow(sig_named), n_distinct(sig_named$clean_name)))
+```
+
+## Curated pathway database
+
+Pathways defined by **metabolite names** (central carbon, amino acids, bile
+acids, etc.) and **lipid ontology classes** from LipidBlast (sphingolipids,
+phospholipids, glycerolipids, fatty acids).
+
+```{r pathway-db}
+pathway_db <- list(
+  list(id="hsa00010", name="Glycolysis / Gluconeogenesis",
+       members=c("Glucose","Glucose-1-phosphate","Glucose-6-phosphate",
+                  "Fructose-6-phosphate","Fructose-1,6-bisphosphate",
+                  "Glyceraldehyde-3-phosphate","Pyruvate","Lactate",
+                  "Lactic acid","Phosphoenolpyruvate"),
+       category="Central carbon"),
+  list(id="hsa00020", name="TCA cycle",
+       members=c("Citric acid","Citrate","Isocitrate","alpha-Ketoglutarate",
+                  "Succinate","Succinic acid","Fumarate","Fumaric acid",
+                  "Malate","Malic acid","Oxaloacetate",
+                  "Glutamic acid","Glutamate","Aspartic acid","Aspartate"),
+       category="Central carbon"),
+  list(id="hsa00480", name="Glutathione metabolism",
+       members=c("Glutathione","GSSG","GSH","gamma-Glutamylcysteine",
+                  "gamma-Glutamylleucine","gamma-Glu-Tyr",
+                  "Glutamic acid","Glutamate","Cystine","Cysteine",
+                  "Glycine","Pyroglutamic acid","5-Oxoproline","Ornithine"),
+       category="Redox"),
+  list(id="hsa00230", name="Purine metabolism",
+       members=c("Adenine","Guanine","Hypoxanthine","Xanthine",
+                  "Adenosine","Guanosine","Inosine","Xanthosine",
+                  "IMP","GMP","AMP","S-Adenosyl-homocysteine",
+                  "2'-Deoxyguanosine","2'-Deoxyadenosine"),
+       category="Nucleotide biosynthesis"),
+  list(id="hsa00240", name="Pyrimidine metabolism",
+       members=c("Uridine","Cytidine","Thymidine","UMP","CMP",
+                  "3-Methylcytidine","Uracil","Thymine","Cytosine"),
+       category="Nucleotide biosynthesis"),
+  list(id="hsa00270", name="One-carbon / Methionine cycle",
+       members=c("S-Adenosyl-homocysteine","S-Adenosylmethionine",
+                  "Methionine","Homocysteine","Homoserine",
+                  "Serine","Glycine","Betaine",
+                  "Folate","5-Methyltetrahydrofolate","Cystathionine"),
+       category="One-carbon"),
+  list(id="hsa00380", name="Tryptophan / Kynurenine pathway",
+       members=c("Tryptophan","Kynurenine","Kynurenic acid",
+                  "3-Hydroxykynurenine","Quinolinic acid",
+                  "Serotonin","5-Hydroxyindoleacetic acid",
+                  "Indole-3-acetic acid","Indole","Indole-3-carboxaldehyde",
+                  "Melatonin","Nicotinamide","NAD","Nicotinic acid"),
+       category="Amino acid"),
+  list(id="hsa00330", name="Arginine / Polyamine metabolism",
+       members=c("Arginine","Ornithine","Citrulline","Proline",
+                  "Putrescine","Spermidine","Spermine","N-Acetylputrescine",
+                  "Glutamic acid","Glutamate","Creatine","Creatinine",
+                  "4-Aminobutyric acid","GABA","Glutamine"),
+       category="Amino acid / Polyamine"),
+  list(id="hsa00340", name="Histidine metabolism",
+       members=c("Histidine","Histamine","Imidazole-4-acetaldehyde",
+                  "Urocanate","Carnosine","Anserine",
+                  "1-Methylhistidine","3-Methylhistidine"),
+       category="Amino acid"),
+  list(id="hsa00280", name="BCAA metabolism",
+       members=c("Valine","Leucine","Isoleucine",
+                  "gamma-Glutamylleucine","Ala-Val","Ala-Ile","Gly-Val"),
+       category="Amino acid"),
+  list(id="hsa00120", name="Bile acid metabolism",
+       members=c("Cholic acid","Chenodeoxycholic acid",
+                  "Deoxycholic acid","Lithocholic acid",
+                  "Ursodeoxycholic acid","Taurine","Taurocholic acid",
+                  "Taurodeoxycholic acid","Taurochenodeoxycholic acid",
+                  "Glycocholic acid","Glycodeoxycholic acid",
+                  "Glycochenodeoxycholic acid"),
+       category="Bile acid"),
+  list(id="hsa00430", name="Taurine / hypotaurine metabolism",
+       members=c("Taurine","Hypotaurine","Cysteic acid",
+                  "Cysteine sulfinic acid"),
+       category="Amino acid"),
+  list(id="hsa00270b", name="Cysteine / Methionine metabolism",
+       members=c("Methionine","Cystine","Cysteine","S-Adenosyl-homocysteine",
+                  "Homoserine","Taurine","Pyroglutamic acid"),
+       category="Amino acid"),
+  list(id="hsa00310", name="Lysine degradation",
+       members=c("Lysine","N-epsilon-Acetyllysine","Pipecolic acid",
+                  "Cadaverine","Saccharopine","2-Aminoadipic acid"),
+       category="Amino acid"),
+  list(id="hsa00590", name="Arachidonic acid / Eicosanoids",
+       members=c("Arachidonic acid","Prostaglandin E1","Prostaglandin E2",
+                  "Prostaglandin D2","Prostaglandin F2alpha",
+                  "Thromboxane B2","Leukotriene B4",
+                  "HETE","5-HETE","12-HETE","15-HETE","FA 20:4"),
+       category="Lipid signalling"),
+  list(id="hsa00600", name="Sphingolipid metabolism",
+       members=NULL,
+       ontology=c("Cer_NS","Cer_NDS","Cer_ADS","Cer_BDS",
+                   "SM","SHexCer","HexCer_AP","Hex2Cer",
+                   "Cer_AP","Cer_AS","HexCer_NS","HexCer_NDS"),
+       category="Lipid"),
+  list(id="hsa00564", name="Glycerophospholipid metabolism",
+       members=c("O-Phosphocolamine"),
+       ontology=c("PC","PE","PS","PI","PA","PG",
+                   "LPC","LPE","LPS","LPI","LPG","LPA",
+                   "EtherPC","EtherPE","EtherLPC","EtherLPE",
+                   "EtherLPG","LNAPE"),
+       category="Lipid"),
+  list(id="hsa00561", name="Glycerolipid metabolism",
+       members=NULL,
+       ontology=c("DG","TG","MG","EtherDG","EtherTG","EtherMG"),
+       category="Lipid"),
+  list(id="hsa01212", name="Fatty acid metabolism",
+       members=c("Linoleic acid","Oleic acid","Palmitic acid",
+                  "Stearic acid","Abietic acid"),
+       ontology=c("FA","FAHFA","DMEDFAHFA","CAR",
+                   "Lineolic acids and derivatives",
+                   "Long-chain fatty acids",
+                   "Fatty acid esters","Fatty acid methyl esters"),
+       category="Lipid")
+)
+cat(sprintf("Pathway database: %d pathways\n", length(pathway_db)))
+```
+
+## Fisher's exact test per pathway
+
+```{r pathway-ora}
+find_pathway_features <- function(pw, data) {
+  idx <- rep(FALSE, nrow(data))
+  if (!is.null(pw$members))
+    idx <- idx | (tolower(data$clean_name) %in% tolower(pw$members))
+  if (!is.null(pw$ontology))
+    idx <- idx | (data$ontology %in% pw$ontology)
+  idx
+}
+
+n_universe <- nrow(all_named)
+n_sig      <- nrow(sig_named)
+
+# Cache membership per pathway
+pathway_sig_cache <- setNames(
+  lapply(pathway_db, function(pw) find_pathway_features(pw, sig_named)),
+  sapply(pathway_db, function(pw) pw$id))
+
+enrichment_results <- data.frame()
+for (pw in pathway_db) {
+  in_univ <- find_pathway_features(pw, all_named)
+  in_sig  <- pathway_sig_cache[[pw$id]]
+  n_pw_univ <- sum(in_univ); n_pw_sig <- sum(in_sig)
+
+  if (n_pw_sig == 0 || n_pw_univ == 0) next
+
+  a <- n_pw_sig; b <- n_sig - n_pw_sig
+  c_val <- max(0, n_pw_univ - n_pw_sig)
+  d     <- max(0, (n_universe - n_sig) - c_val)
+
+  ft <- fisher.test(matrix(c(a, c_val, b, d), nrow = 2),
+                    alternative = "greater")
+  expected <- n_pw_univ * (n_sig / n_universe)
+  er       <- a / max(expected, 0.01)
+  hit_names <- sort(unique(sig_named$clean_name[in_sig]))
+
+  enrichment_results <- rbind(enrichment_results, data.frame(
+    pathway_id       = pw$id,
+    pathway_name     = pw$name,
+    category         = pw$category,
+    hits_sig         = a,
+    hits_universe    = n_pw_univ,
+    enrichment_ratio = round(er, 3),
+    p_value          = ft$p.value,
+    hit_metabolites  = paste(hit_names, collapse = "; "),
+    stringsAsFactors = FALSE))
+}
+enrichment_results$q_value <- p.adjust(enrichment_results$p_value, method = "BH")
+enrichment_results <- enrichment_results %>% arrange(p_value)
+```
+
+## Direction summary per pathway
+
+```{r direction-summary}
+dir_summary <- bind_rows(lapply(seq_len(nrow(enrichment_results)), function(i) {
+  r      <- enrichment_results[i, ]
+  in_sig <- pathway_sig_cache[[r$pathway_id]]
+  hits   <- sig_named[in_sig, ] %>%
+    group_by(direction) %>%
+    summarise(n_unique = n_distinct(clean_name),
+              mean_fc  = mean(fc, na.rm = TRUE),
+              .groups  = "drop")
+
+  n_up      <- sum(hits$n_unique[hits$direction == "Up_in_Tumour"])
+  n_down    <- sum(hits$n_unique[hits$direction == "Down_in_Tumour"])
+  fc_up     <- if (any(hits$direction == "Up_in_Tumour"))
+                  hits$mean_fc[hits$direction == "Up_in_Tumour"] else NA
+  fc_down   <- if (any(hits$direction == "Down_in_Tumour"))
+                  hits$mean_fc[hits$direction == "Down_in_Tumour"] else NA
+
+  data.frame(pathway_id = r$pathway_id, pathway_name = r$pathway_name,
+             up_unique = n_up, down_unique = n_down,
+             mean_fc_up = round(fc_up, 2), mean_fc_down = round(fc_down, 2),
+             p_value = r$p_value, q_value = r$q_value,
+             stringsAsFactors = FALSE)
+}))
+```
+
+## Table 3 — enriched pathways
+
+```{r table3}
+table3 <- enrichment_results %>%
+  left_join(dir_summary %>% select(pathway_id, up_unique, down_unique,
+                                    mean_fc_up, mean_fc_down),
+            by = "pathway_id") %>%
+  mutate(p_value = signif(p_value, 3),
+         q_value = signif(q_value, 3),
+         significance = case_when(q_value < 0.001 ~ "***",
+                                   q_value < 0.01  ~ "**",
+                                   q_value < 0.05  ~ "*",
+                                   q_value < 0.1   ~ ".",
+                                   TRUE            ~ "ns"))
+write.csv(table3, file.path(paths$tables, "Table3_enriched_pathways.csv"),
+          row.names = FALSE)
+kable(table3 %>% select(pathway_name, category, hits_sig, hits_universe,
+                          enrichment_ratio, p_value, q_value,
+                          up_unique, down_unique, significance),
+      col.names = c("Pathway","Category","Hits (sig)","Hits (univ)","ER","p","q",
+                     "Up","Down","Sig"),
+      caption = "Table 3 — pathway enrichment (Fisher exact, BH-corrected).")
+```
+
+## Figure 6 — enrichment bubble plot
+
+```{r bubble-plot, fig.height=7}
+plot_df <- enrichment_results %>%
+  mutate(neg_log10_p   = -log10(p_value),
+         pathway_label = paste0(pathway_name, " (", hits_sig, "/",
+                                 hits_universe, ")")) %>%
+  arrange(enrichment_ratio) %>%
+  mutate(pathway_label = factor(pathway_label, levels = pathway_label))
+
+p_bubble <- ggplot(plot_df, aes(x = enrichment_ratio, y = pathway_label)) +
+  geom_point(aes(size = hits_sig, colour = neg_log10_p), alpha = 0.85) +
+  scale_colour_gradient(low = "#FDE725", high = "#440154",
+                         name = expression(-log[10](italic(p)))) +
+  scale_size_continuous(range = c(3, 14), name = "Sig. hits") +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  labs(x = "Enrichment Ratio (observed / expected)", y = NULL,
+       title = "Metabolic pathway enrichment — CRC tumour vs. non-tumour",
+       subtitle = sprintf("ORA (Fisher exact, BH) | %d sig / %d measured | %d pathways FDR<0.05",
+                           n_sig, n_universe,
+                           sum(enrichment_results$q_value < 0.05))) +
+  theme_bw(base_size = 12)
+if (any(enrichment_results$q_value < 0.05)) {
+  sig_pts <- plot_df %>% filter(q_value < 0.05)
+  p_bubble <- p_bubble + geom_point(data = sig_pts, shape = 1,
+                                      colour = "red", stroke = 1.0, size = 5)
+}
+save_fig(p_bubble, "06_Pathway_enrichment_bubble", width = 12, height = 7)
+p_bubble
+```
+
+## Figure 6b — direction bar chart
+
+```{r direction-bar, fig.height=6}
+dir_plot_df <- dir_summary %>%
+  pivot_longer(cols = c(up_unique, down_unique),
+               names_to = "direction", values_to = "count") %>%
+  mutate(direction = ifelse(direction == "up_unique",
+                             "Up in Tumour", "Down in Tumour")) %>%
+  filter(count > 0)
+pw_order <- dir_summary %>%
+  mutate(total = up_unique + down_unique) %>%
+  arrange(total) %>% pull(pathway_name)
+dir_plot_df$pathway_name <- factor(dir_plot_df$pathway_name, levels = pw_order)
+
+p_dir <- ggplot(dir_plot_df,
+                 aes(x = count, y = pathway_name, fill = direction)) +
+  geom_col(position = "stack", width = 0.6, alpha = 0.85) +
+  scale_fill_manual(values = c("Up in Tumour" = "#D73027",
+                                "Down in Tumour" = "#4575B4"),
+                    name = "Direction") +
+  labs(x = "Number of significant metabolites (unique)", y = NULL,
+       title = "Direction of metabolite changes per pathway") +
+  theme_bw(base_size = 12)
+save_fig(p_dir, "06b_Pathway_direction_bar", width = 10, height = 6.5)
+p_dir
+```
+
+---
+
+# 2. Colon Sidedness Analysis
+
+Right-sided (proximal, midgut) vs. left-sided (distal, hindgut) colon
+cancers differ molecularly and prognostically. This section tests whether
+the tumour metabolome differs by side in the colon-only subset.
+
+## Load data and define sides
+
+```{r sidedness-load}
+dat  <- readRDS(file.path(paths$results,
+                           "02b_batch_corrected_datasets.rds"))
+clin <- read.csv(file.path(paths$tables, "clinical_metadata_linked.csv"),
+                 stringsAsFactors = FALSE)
+clin$core_id <- str_replace(clin$serial_id, "CO", "C0")
+
+mode_names  <- c("meta_pos","meta_neg","lip_pos","lip_neg")
+mode_labels <- c("Metabolomics ESI+","Metabolomics ESI-",
+                 "Lipidomics ESI+",   "Lipidomics ESI-")
+
+colon_clin <- clin[clin$location == "Colon" &
+                     clin$colon_side %in% c("Right","Left"), ]
+cat(sprintf("Colon patients: %d (Right=%d, Left=%d)\n",
+            nrow(colon_clin),
+            sum(colon_clin$colon_side == "Right"),
+            sum(colon_clin$colon_side == "Left")))
+
+get_side_map <- function(pair_info) {
+  m <- match(pair_info$patient_base, colon_clin$core_id)
+  keep <- !is.na(m)
+  side <- colon_clin$colon_side[m[keep]]
+  names(side) <- pair_info$patient_id[keep]
+  side
+}
+```
+
+## Within-tumour Wilcoxon (Right vs Left)
+
+```{r sidedness-stats, cache=TRUE}
+all_results <- list()
+for (i in seq_along(mode_names)) {
+  mn <- mode_names[i]; ml <- mode_labels[i]
+  cat(sprintf("\n%s ... ", ml))
+
+  p  <- dat[[mn]]$paired
+  fm <- dat[[mn]]$feature_meta
+  side_map <- get_side_map(p$pair_info)
+  common_R <- intersect(names(side_map)[side_map == "Right"],
+                         colnames(p$area_T))
+  common_L <- intersect(names(side_map)[side_map == "Left"],
+                         colnames(p$area_T))
+  n_features <- nrow(p$area_T)
+
+  # Tumour Right vs Left (Wilcoxon rank-sum)
+  tumour_pval <- tumour_fc <- rep(NA_real_, n_features)
+  for (j in seq_len(n_features)) {
+    vR <- as.numeric(p$area_T[j, common_R]); vR <- vR[!is.na(vR)]
+    vL <- as.numeric(p$area_T[j, common_L]); vL <- vL[!is.na(vL)]
+    if (length(vR) >= 3 && length(vL) >= 3) {
+      wt <- suppressWarnings(wilcox.test(vR, vL))
+      tumour_pval[j] <- wt$p.value
+      tumour_fc[j]   <- mean(vR, na.rm=TRUE) / mean(vL, na.rm=TRUE)
+    }
+  }
+  tumour_qval <- p.adjust(tumour_pval, method = "BH")
+
+  # Paired FC shift: log2(T/N)_R vs log2(T/N)_L
+  paired_pval <- median_R <- median_L <- rep(NA_real_, n_features)
+  all_colon <- c(common_R, common_L)
+  for (j in seq_len(n_features)) {
+    logfc <- log2((as.numeric(p$area_T[j, all_colon]) + 1) /
+                  (as.numeric(p$area_N[j, all_colon]) + 1))
+    names(logfc) <- all_colon
+    lR <- logfc[common_R]; lR <- lR[!is.na(lR) & is.finite(lR)]
+    lL <- logfc[common_L]; lL <- lL[!is.na(lL) & is.finite(lL)]
+    if (length(lR) >= 3 && length(lL) >= 3) {
+      wt <- suppressWarnings(wilcox.test(lR, lL))
+      paired_pval[j] <- wt$p.value
+      median_R[j] <- median(lR); median_L[j] <- median(lL)
+    }
+  }
+  paired_qval <- p.adjust(paired_pval, method = "BH")
+
+  all_results[[mn]] <- list(
+    res = data.frame(
+      feature_id = fm$alignment_id, metabolite = fm$metabolite,
+      mz = fm$mz, rt_min = fm$rt_min, adduct = fm$adduct,
+      ontology = fm$ontology, mode = mn, mode_label = ml,
+      tumour_pval = tumour_pval, tumour_qval = tumour_qval,
+      tumour_fc_RL = tumour_fc, log2fc_RL = log2(tumour_fc),
+      paired_fc_pval = paired_pval, paired_fc_qval = paired_qval,
+      median_logfc_R = median_R, median_logfc_L = median_L,
+      delta_logfc = median_R - median_L,
+      stringsAsFactors = FALSE),
+    area_T = p$area_T, area_N = p$area_N,
+    common_R = common_R, common_L = common_L, fm = fm)
+
+  cat(sprintf("sig tumour R vs L (q<0.05): %d / %d\n",
+              sum(tumour_qval < 0.05, na.rm = TRUE), n_features))
+}
+
+all_res_df <- do.call(rbind, lapply(all_results, function(x) x$res))
+write.csv(all_res_df[order(all_res_df$tumour_pval), ],
+          file.path(paths$tables, "Table_sidedness_differential.csv"),
+          row.names = FALSE)
+```
+
+## Volcano plots — Right vs Left tumour
+
+```{r sidedness-volcano, fig.height=10}
+volcano_list <- list()
+for (i in seq_along(mode_names)) {
+  mn <- mode_names[i]; ml <- mode_labels[i]
+  res <- all_results[[mn]]$res
+  res$sig <- ifelse(!is.na(res$tumour_qval) & res$tumour_qval < 0.05,
+                     "Significant", "NS")
+  res$label <- ifelse(res$sig == "Significant" & res$metabolite != "Unknown",
+                       res$metabolite, "")
+  res$label <- ifelse(nchar(res$label) > 35,
+                       paste0(substr(res$label, 1, 32), "..."), res$label)
+  res$nlog10q <- pmin(-log10(res$tumour_qval), 15, na.rm = TRUE)
+
+  volcano_list[[i]] <- ggplot(res, aes(x = log2fc_RL, y = nlog10q, color = sig)) +
+    geom_point(alpha = 0.5, size = 1) +
+    scale_color_manual(values = c("Significant" = "red3", "NS" = "grey60")) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
+    geom_vline(xintercept = c(-1, 1), linetype = "dotted", color = "grey40") +
+    geom_text_repel(aes(label = label), size = 2, max.overlaps = 12,
+                    color = "black", segment.color = "grey50") +
+    labs(title = ml, x = expression(log[2]~"FC (R / L)"),
+         y = expression(-log[10]~"q")) +
+    theme_bw(base_size = 10) + theme(legend.position = "none")
+}
+fig_s1 <- wrap_plots(volcano_list, ncol = 2) +
+  plot_annotation(title = "Right vs. Left colon — tumour metabolite differences")
+save_fig(fig_s1, "FigS1_sidedness_volcano", width = 12, height = 10)
+fig_s1
+```
+
+## OPLS-DA — best mode
+
+```{r sidedness-opls, cache=TRUE, fig.height=6}
+sig_counts <- sapply(all_results,
+                      function(x) sum(x$res$tumour_qval < 0.05, na.rm = TRUE))
+best_mode <- if (max(sig_counts) > 0) names(which.max(sig_counts)) else
+              names(which.min(sapply(all_results,
+                function(x) median(x$res$tumour_pval, na.rm = TRUE))))
+cat(sprintf("Best mode for OPLS-DA: %s (%d sig)\n", best_mode, sig_counts[best_mode]))
+
+ar   <- all_results[[best_mode]]
+ids  <- c(ar$common_R, ar$common_L)
+mat  <- t(ar$area_T[, ids])
+side <- factor(ifelse(rownames(mat) %in% ar$common_R, "Right", "Left"),
+                levels = c("Left","Right"))
+
+col_var <- apply(mat, 2, var, na.rm = TRUE)
+keep    <- which(!is.na(col_var) & col_var > 0)
+mat     <- mat[, keep]
+mat     <- impute_row_median(t(mat)); mat <- t(mat)
+mat_sc  <- scale(log2(mat + 1))
+
+opls_sd <- tryCatch(
+  opls(mat_sc, side, predI = 1, orthoI = NA, permI = 1000,
+       fig.pdfC = "none", info.txtC = "none"),
+  error = function(e) tryCatch(
+    opls(mat_sc, side, predI = 1, orthoI = 0, permI = 1000,
+         fig.pdfC = "none", info.txtC = "none"),
+    error = function(e2) NULL))
+
+if (!is.null(opls_sd)) {
+  r2y <- opls_sd@summaryDF$`R2Y(cum)`
+  q2  <- opls_sd@summaryDF$`Q2(cum)`
+  pQ2 <- opls_sd@summaryDF$pQ2
+  cat(sprintf("  R²Y=%.3f  Q²=%.3f  pQ²=%.3f\n", r2y, q2, pQ2))
+
+  scores <- data.frame(
+    t1   = getScoreMN(opls_sd)[, 1],
+    Side = side)
+  has_ortho <- ncol(getScoreMN(opls_sd, orthoL = TRUE)) > 0
+  scores$to1 <- if (has_ortho) getScoreMN(opls_sd, orthoL = TRUE)[, 1]
+                else getScoreMN(opls_sd)[, 2]
+
+  fig_s2 <- ggplot(scores, aes(x = t1, y = to1, color = Side, fill = Side)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    stat_ellipse(level = 0.95, alpha = 0.1, geom = "polygon") +
+    scale_color_manual(values = c("Right" = "#E74C3C", "Left" = "#3498DB")) +
+    scale_fill_manual(values = c("Right" = "#E74C3C", "Left" = "#3498DB")) +
+    labs(title = sprintf("OPLS-DA — %s tumours (R vs L)",
+                          mode_labels[match(best_mode, mode_names)]),
+         subtitle = sprintf("R²Y=%.3f  Q²=%.3f  pQ²=%.3f", r2y, q2, pQ2),
+         x = "t_pred[1]",
+         y = if (has_ortho) "t_orth[1]" else "t[2]") +
+    theme_bw(base_size = 12)
+  save_fig(fig_s2, "FigS2_sidedness_OPLSDA", width = 8, height = 6)
+  fig_s2
+}
+```
+
+## Sidedness outputs summary
+
+```{r sidedness-summary}
+ss_summary <- data.frame(
+  Mode       = mode_labels,
+  Sig_TvsN   = sapply(all_results,
+                       function(x) sum(x$res$tumour_qval < 0.05, na.rm = TRUE)),
+  Sig_paired = sapply(all_results,
+                       function(x) sum(x$res$paired_fc_qval < 0.05, na.rm = TRUE)),
+  Total      = sapply(all_results, function(x) nrow(x$res)))
+kable(ss_summary,
+      col.names = c("Mode","R vs L tumour (q<0.05)",
+                     "T/N shift (q<0.05)","Total features"),
+      caption = "Sidedness analysis — significant features per mode.")
+
+saveRDS(list(all_results_df = all_res_df, colon_clinical = colon_clin,
+              oplsda_model = if (exists("opls_sd")) opls_sd else NULL,
+              oplsda_mode = best_mode),
+        file.path(paths$results, "06_sidedness_results.rds"))
+```
+
+---
+
+# 3. ROC Biomarker Panel
+
+## Candidate selection
+
+Criteria:
+
+- q < 0·01 (stringent FDR)
+- OPLS-DA VIP ≥ 2·0 (robust multivariate importance)
+- MSI confidence level 2 or 3 (named, interpretable)
+- |log2FC| ≥ 1 (≥ 2-fold)
+
+```{r roc-candidates}
+vip_all <- do.call(rbind, lapply(names(stat$opls_results), function(m) {
+  v <- stat$opls_results[[m]]$vip
+  if (is.null(v)) return(NULL)
+  v$mode <- m; v
+}))
+ar <- merge(stat$all_results, vip_all[, c("alignment_id","mode","vip")],
+            by = c("alignment_id","mode"), all.x = TRUE)
+
+candidates <- ar[!is.na(ar$q_value) & !is.na(ar$vip) &
+                   ar$q_value < 0.01 & ar$vip >= 2.0 &
+                   ar$msi_level %in% c(2, 3) &
+                   abs(ar$log2fc) >= 1, ]
+candidates$composite <- -log10(candidates$q_value) *
+                         candidates$vip * abs(candidates$log2fc)
+candidates <- candidates[order(-candidates$composite), ]
+
+n_top <- min(20, nrow(candidates))
+top20 <- candidates[1:n_top, ]
+cat(sprintf("Candidates passing all criteria: %d (using top %d)\n",
+            nrow(candidates), n_top))
+```
+
+## Individual ROC curves
+
+```{r roc-individual}
+bc <- dat   # already loaded above
+
+build_roc_data <- function(feature_row, bc_data) {
+  mode <- feature_row$mode; aid <- as.character(feature_row$alignment_id)
+  paired <- bc_data[[mode]]$paired
+  if (!aid %in% rownames(paired$area_T)) return(NULL)
+  vT <- as.numeric(paired$area_T[aid, ])
+  vN <- as.numeric(paired$area_N[aid, ])
+  data.frame(value = c(vT, vN),
+             class = rep(c(1L, 0L), each = length(vT)),
+             patient = rep(colnames(paired$area_T), 2),
+             stringsAsFactors = FALSE)
+}
+
+roc_data_list <- lapply(seq_len(n_top), function(i) {
+  rd <- build_roc_data(top20[i, ], bc)
+  if (is.null(rd)) return(NULL)
+  rd[complete.cases(rd), ]
+})
+valid <- !sapply(roc_data_list, is.null)
+
+roc_results <- vector("list", n_top)
+for (i in seq_len(n_top)) {
+  if (!valid[i]) next
+  rd <- roc_data_list[[i]]
+  ro <- roc(rd$class, rd$value, quiet = TRUE, direction = "auto")
+  cb <- coords(ro, "best",
+               ret = c("threshold","sensitivity","specificity"),
+               best.method = "youden")
+  roc_results[[i]] <- list(roc = ro, auc = as.numeric(auc(ro)),
+                           sens = cb$sensitivity[1], spec = cb$specificity[1])
+}
+```
+
+## Multi-marker panel with 10-fold CV
+
+```{r roc-panel, cache=TRUE}
+build_panel_matrix <- function(top_n, top20_df, bc_data) {
+  rd_list <- lapply(seq_len(top_n), function(i) {
+    rd <- build_roc_data(top20_df[i, ], bc_data)
+    if (!is.null(rd)) rd[complete.cases(rd), ] else NULL
+  })
+  patient_sets <- lapply(rd_list,
+                          function(rd) if (is.null(rd)) character(0)
+                                        else unique(rd$patient))
+  common_patients <- Reduce(intersect,
+                             patient_sets[!sapply(patient_sets,
+                                                    function(x) length(x)==0)])
+  mat_cols <- lapply(rd_list, function(rd) {
+    if (is.null(rd)) return(NULL)
+    s <- rd[rd$patient %in% common_patients, ]
+    s <- s[order(-s$class, s$patient), ]
+    s$value
+  })
+  rd_ref <- rd_list[[which(!sapply(rd_list, is.null))[1]]]
+  rd_ref <- rd_ref[rd_ref$patient %in% common_patients, ]
+  rd_ref <- rd_ref[order(-rd_ref$class, rd_ref$patient), ]
+
+  mat <- do.call(cbind, mat_cols); colnames(mat) <- paste0("M", seq_len(ncol(mat)))
+  data.frame(class = rd_ref$class, patient = rd_ref$patient, mat,
+             stringsAsFactors = FALSE)
+}
+
+cv_roc_panel <- function(panel_df, n_folds = 10) {
+  patients <- unique(panel_df$patient)
+  fold_assign <- sample(rep(seq_len(n_folds), length.out = length(patients)))
+  patient_fold <- setNames(fold_assign, patients)
+  panel_df$fold <- patient_fold[as.character(panel_df$patient)]
+
+  pred_all  <- numeric(nrow(panel_df))
+  feat_cols <- grep("^M", names(panel_df), value = TRUE)
+  fmla <- as.formula(paste("class ~", paste(feat_cols, collapse = " + ")))
+
+  for (f in seq_len(n_folds)) {
+    train <- panel_df[panel_df$fold != f, ]
+    test  <- panel_df[panel_df$fold == f, ]
+    fit <- suppressWarnings(glm(fmla, data = train,
+                                 family = binomial,
+                                 control = glm.control(maxit = 500)))
+    pred_all[panel_df$fold == f] <- predict(fit, newdata = test,
+                                             type = "response")
+  }
+  ro <- roc(panel_df$class, pred_all, quiet = TRUE)
+  list(roc = ro, auc = as.numeric(auc(ro)))
+}
+
+panel_sizes   <- c(5, 10, 20)
+panel_results <- list()
+for (ps in panel_sizes) {
+  pmat <- build_panel_matrix(ps, top20, bc)
+  aucs <- replicate(5, cv_roc_panel(pmat)$auc)
+  best_res <- cv_roc_panel(pmat)
+  panel_results[[as.character(ps)]] <- list(
+    roc = best_res$roc, auc = best_res$auc,
+    auc_mean = mean(aucs), auc_sd = sd(aucs), n_markers = ps)
+  cat(sprintf("  %d-marker panel: CV-AUC = %.3f (mean=%.3f, sd=%.3f)\n",
+              ps, best_res$auc, mean(aucs), sd(aucs)))
+}
+
+best_ind_idx <- which.max(sapply(roc_results,
+                                    function(x) if (is.null(x)) 0 else x$auc))
+best_ind_auc <- roc_results[[best_ind_idx]]$auc
+cat(sprintf("\nBest individual: %s (AUC=%.3f)\n",
+            top20$metabolite[best_ind_idx], best_ind_auc))
+```
+
+## Figure 8 — ROC panels
+
+```{r figure-8, fig.height=12}
+panel_cols <- c("#E41A1C","#377EB8","#4DAF4A","#984EA3","#FF7F00")
+
+# Fig 8A: top 5 individual curves
+auc_vals <- sapply(seq_len(n_top),
+                    function(i) if (is.null(roc_results[[i]])) 0
+                                else roc_results[[i]]$auc)
+top5_idx <- order(-auc_vals)[1:5]
+fig8a_data <- do.call(rbind, lapply(seq_along(top5_idx), function(j) {
+  i <- top5_idx[j]; r <- roc_results[[i]]$roc
+  nm <- gsub("low score: ", "", top20$metabolite[i])
+  if (nchar(nm) > 35) nm <- paste0(substr(nm, 1, 32), "...")
+  data.frame(sens = r$sensitivities, spec = 1 - r$specificities,
+             metabolite = sprintf("%s (AUC=%.3f)", nm,
+                                   roc_results[[i]]$auc),
+             stringsAsFactors = FALSE)
+}))
+fig8a <- ggplot(fig8a_data, aes(x = spec, y = sens, color = metabolite)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = panel_cols) +
+  labs(title = "A", x = "1 - Specificity", y = "Sensitivity", color = NULL) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = c(0.65, 0.2),
+        legend.text = element_text(size = 7)) +
+  coord_equal()
+
+# Fig 8B: panel ROCs + best individual
+fig8b_data <- do.call(rbind, lapply(as.character(panel_sizes), function(ps) {
+  r <- panel_results[[ps]]$roc
+  data.frame(sens = r$sensitivities, spec = 1 - r$specificities,
+             panel = sprintf("%s-marker panel (AUC=%.3f)",
+                              ps, panel_results[[ps]]$auc),
+             stringsAsFactors = FALSE)
+}))
+best_r <- roc_results[[best_ind_idx]]$roc
+best_nm <- gsub("low score: ", "", top20$metabolite[best_ind_idx])
+fig8b_data <- rbind(fig8b_data, data.frame(
+  sens = best_r$sensitivities, spec = 1 - best_r$specificities,
+  panel = sprintf("Best individual: %s (AUC=%.3f)", best_nm, best_ind_auc),
+  stringsAsFactors = FALSE))
+fig8b <- ggplot(fig8b_data, aes(x = spec, y = sens, color = panel)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c(panel_cols[1:3], "grey40")) +
+  labs(title = "B", x = "1 - Specificity", y = "Sensitivity", color = NULL) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = c(0.62, 0.2),
+        legend.text = element_text(size = 7)) +
+  coord_equal()
+
+# Fig 8C: AUC bar plot for top 20
+auc_bar <- data.frame(
+  metabolite = sapply(seq_len(n_top), function(i) {
+    nm <- gsub("low score: ", "", top20$metabolite[i])
+    if (nchar(nm) > 30) nm <- paste0(substr(nm, 1, 27), "...")
+    nm}),
+  auc = sapply(seq_len(n_top),
+                function(i) if (is.null(roc_results[[i]])) NA
+                              else roc_results[[i]]$auc),
+  direction = top20$direction,
+  stringsAsFactors = FALSE)
+auc_bar$metabolite <- factor(auc_bar$metabolite, levels = rev(auc_bar$metabolite))
+
+fig8c <- ggplot(auc_bar, aes(x = metabolite, y = auc, fill = direction)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = c(0.7, 0.8), linetype = c("dashed","dotted"),
+             color = "grey40") +
+  geom_text(aes(label = sprintf("%.3f", auc)), hjust = -0.1, size = 2.8) +
+  scale_fill_manual(values = c("Up_in_Tumour" = "#E41A1C",
+                                "Down_in_Tumour" = "#377EB8"),
+                    labels = c("Up_in_Tumour" = "Elevated",
+                                "Down_in_Tumour" = "Decreased")) +
+  scale_y_continuous(limits = c(0, 1.05), breaks = seq(0, 1, 0.1)) +
+  coord_flip() +
+  labs(title = "C", x = NULL, y = "AUC", fill = "In tumour") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "bottom")
+
+fig8 <- (fig8a | fig8b) / fig8c + plot_layout(heights = c(1, 1.2)) +
+  plot_annotation(title = "Figure 8 — Diagnostic biomarker panel (ROC analysis)",
+                  subtitle = "CRC tumour vs. adjacent normal tissue (paired n = 182)")
+save_fig(fig8, "Figure_08_ROC_biomarker_panel", width = 14, height = 12)
+fig8
+```
+
+## Biomarker panel table
+
+```{r biomarker-table}
+tbl <- data.frame(
+  Rank       = seq_len(n_top),
+  Metabolite = top20$metabolite,
+  Mode       = top20$mode,
+  m_z        = round(top20$mz, 4),
+  RT_min     = round(top20$rt_min, 2),
+  MSI        = top20$msi_level,
+  Direction  = top20$direction,
+  Fold_Change = round(2^abs(top20$log2fc), 2),
+  log2FC     = round(top20$log2fc, 3),
+  q_value    = signif(top20$q_value, 3),
+  VIP        = round(top20$vip, 3),
+  Composite  = round(top20$composite, 1),
+  AUC        = round(sapply(seq_len(n_top),
+                     function(i) if (is.null(roc_results[[i]])) NA
+                                   else roc_results[[i]]$auc), 3))
+write.csv(tbl, file.path(paths$tables, "Table_biomarker_panel.csv"),
+          row.names = FALSE)
+kable(tbl, caption = "Top 20 biomarker candidates with ROC AUC.")
+
+saveRDS(list(top20_candidates = top20, roc_results = roc_results,
+              panel_results = panel_results, biomarker_table = tbl,
+              best_individual = list(metabolite = top20$metabolite[best_ind_idx],
+                                      auc = best_ind_auc)),
+        file.path(paths$results, "07_ROC_results.rds"))
+```
+
+## Translational outlook
+
+Candidate metabolites here constitute a **tissue-level discovery panel**.
+Before clinical use they require:
+
+1. External validation in an independent CRC tissue cohort
+2. Cross-sample-type validation in plasma, stool, and/or urine
+3. Multi-centre confirmation (this single-centre East Asian cohort limits
+   current generalisability)
+
+Tissue signals with known presence in accessible biofluids (e.g., taurine,
+specific LPCs) are priority candidates for the **Year 3–4 targeted
+validation phase** of the NSTC grant.
+
+---
+
+# Outputs
+
+| File | Description |
+|------|-------------|
+| `output/tables/Table3_enriched_pathways.csv` | Pathway enrichment (manuscript Table 3) |
+| `output/tables/Table_sidedness_differential.csv` | Right-vs-left tumour per-feature results |
+| `output/tables/Table_biomarker_panel.csv` | Top 20 biomarker candidates |
+| `output/figures/06_Pathway_*` | Pathway enrichment figures (Figure 6) |
+| `output/figures/FigS*_sidedness_*` | Sidedness figures (supplementary) |
+| `output/figures/Figure_08_ROC_biomarker_panel.*` | ROC figure (Figure 8) |
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,695 @@
+---
+title: "CRC Tissue Metabolomics — Part 1: Preprocessing, QC, and Batch Correction"
+author: "Chang Gung Memorial Hospital — Metabolomics Medical Research Program"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+params:
+  base_dir: "C:/Users/Eric/ClaudeCowork_CRC_metabolomics"
+---
+
+```{r base-dir-from-params, include=FALSE}
+base_dir <- params$base_dir
+```
+
+```{r child = "_setup.Rmd"}
+```
+
+# Overview
+
+This document covers the **preprocessing pipeline** for the CRC tissue
+metabolomics study. It takes raw MS-DIAL exports through QC filtering,
+normalisation, and batch correction, producing the analysis-ready feature
+matrix used by all downstream analyses.
+
+| Step | Method | Output |
+|------|--------|--------|
+| 1. Data import | MS-DIAL xlsx → feature × sample matrix | `01_raw_parsed_datasets.rds` |
+| 2. QC filtering | Blank subtraction, fill %, missing %, RSD < 30% | Filtered matrices |
+| 3. Normalisation | Probabilistic Quotient Normalisation (PQN) | `02_filtered_normalized_datasets.rds` |
+| 4. Batch correction | QC-RLSC (LOESS, span = 0·75) | `02b_batch_corrected_datasets.rds` |
+| 5. QC verification | RSD distribution, D-ratio, PCA of QC pools | Figures 2A–2E |
+
+**Input data:** 4 MS-DIAL xlsx exports in `Tsai CRC/2026 export/` (≈ 420 MB total).
+
+**Expected render time on a typical workstation: 25–35 min** on the first run;
+subsequent renders hit the cache and complete in < 1 min unless chunks change.
+
+**Portability:** change `params$base_dir` at the top of this file (or pass
+`rmarkdown::render(…, params = list(base_dir = "…"))`) to run on another machine.
+
+---
+
+# 1. Sample list parsing
+
+```{r msdial-files}
+# The 4 MS-DIAL export files (one per LC-MS mode)
+msdial_files <- list(
+  meta_pos = file.path(paths$data, "meta pos",
+                       "Meta_Pos_Area_1_2026_03_16_15_18_48.xlsx"),
+  meta_neg = file.path(paths$data, "meta neg",
+                       "Meta_Neg_Area_1_2026_03_17_15_59_09.xlsx"),
+  lip_pos  = file.path(paths$data, "lip pos",
+                       "Lip_Pos_Area_1_2026_03_18_16_06_37.xlsx"),
+  lip_neg  = file.path(paths$data, "lip neg",
+                       "Lip_Neg_Area_2_2026_03_18_16_23_07.xlsx")
+)
+stopifnot(all(sapply(msdial_files, file.exists)))
+```
+
+Parse the patient sample list and extract paired tumour/non-tumour IDs.
+
+```{r parse-sample-list}
+sample_list <- read_excel(paths$sample)
+
+# Columns 1–2 are 實驗室編號 (lab_id) and 原編號 (orig_id)
+sample_meta <- sample_list %>%
+  select(1, 2) %>%
+  setNames(c("lab_id", "orig_id")) %>%
+  filter(!is.na(lab_id) & lab_id != "") %>%
+  mutate(
+    tissue_type = case_when(
+      str_detect(orig_id, "N\\d+$") ~ "N",   # non-tumour
+      str_detect(orig_id, "T\\d+$") ~ "T",   # tumour
+      TRUE ~ NA_character_
+    ),
+    patient_base = str_replace(orig_id, "[NT]\\d+$", ""),
+    patient_id   = paste0("P", str_pad(dense_rank(patient_base),
+                                        width = 3, pad = "0"))
+  )
+
+# Pairing table: one row per patient with both lab_ids
+pair_table <- sample_meta %>%
+  select(patient_id, patient_base, lab_id, tissue_type) %>%
+  pivot_wider(names_from = tissue_type, values_from = lab_id,
+              names_prefix = "lab_id_") %>%
+  filter(!is.na(lab_id_N) & !is.na(lab_id_T))
+
+cat(sprintf("Total samples: %d\n",           nrow(sample_meta)))
+cat(sprintf("N (non-tumour): %d\n",         sum(sample_meta$tissue_type == "N", na.rm = TRUE)))
+cat(sprintf("T (tumour): %d\n",             sum(sample_meta$tissue_type == "T", na.rm = TRUE)))
+cat(sprintf("Unique patients: %d\n",        n_distinct(sample_meta$patient_base)))
+cat(sprintf("Complete pairs: %d\n",         nrow(pair_table)))
+```
+
+---
+
+# 2. MS-DIAL import
+
+The `parse_msdial()` function handles the MS-DIAL export format: 4 metadata
+rows + 1 header row + feature rows. Annotation columns (m/z, RT, name,
+adduct, formula, ontology, MS2 flag) are separated from sample-intensity
+columns; the latter become the feature × sample matrix.
+
+```{r parse-msdial-fn}
+parse_msdial <- function(filepath, mode_label = "unknown") {
+
+  cat(sprintf("\n--- Parsing %s: %s ---\n", mode_label, basename(filepath)))
+  raw <- read_excel(filepath, col_names = FALSE, col_types = "text")
+  cat(sprintf("  Raw dimensions: %d rows x %d cols\n", nrow(raw), ncol(raw)))
+
+  headers <- as.character(raw[5, ])
+
+  annot_cols <- which(headers %in% c(
+    "Alignment ID", "Average Rt(min)", "Average Mz", "Metabolite name",
+    "Adduct type", "Post curation result", "Fill %", "MS/MS assigned",
+    "Reference RT", "Reference m/z", "Formula", "Ontology", "INCHIKEY",
+    "SMILES", "Annotation tag (VS1.0)", "RT matched", "m/z matched",
+    "MS/MS matched", "Comment", "Manually modified for quantification",
+    "Manually modified for annotation", "Isotope tracking parent ID",
+    "Isotope tracking weight number", "RT similarity",
+    "Dot product", "S/N average",
+    "Spectrum reference file name", "MS1 isotopic spectrum",
+    "MS/MS spectrum", "Total score", "RT factor", "m/z factor",
+    "Reverse dot product", "Fragment presence %"
+  ))
+
+  if (length(annot_cols) == 0) {
+    class_row <- as.character(raw[1, ])
+    first_sample_col <- min(which(class_row %in% c("Blank", "N", "T", "QC",
+                                                    "Sample", "NA")))
+    n_annot <- first_sample_col - 1
+  } else {
+    n_annot <- max(annot_cols)
+  }
+  cat(sprintf("  Annotation columns: %d\n", n_annot))
+
+  class_row    <- as.character(raw[1, (n_annot + 1):ncol(raw)])
+  inj_row      <- as.character(raw[3, (n_annot + 1):ncol(raw)])
+  sample_names <- headers[(n_annot + 1):ncol(raw)]
+
+  smeta <- data.frame(
+    col_name  = sample_names,
+    class     = class_row,
+    inj_order = as.numeric(inj_row),
+    stringsAsFactors = FALSE
+  )
+  is_summary <- str_detect(sample_names, "^(Average|Stdev)") |
+                is.na(class_row) | class_row == ""
+  smeta <- smeta[!is_summary, ]
+  sample_cols <- which(!is_summary) + n_annot
+
+  cat(sprintf("  Sample columns: %d (after removing summary cols)\n", nrow(smeta)))
+  cat(sprintf("    Blank: %d | N: %d | T: %d | QC: %d | Other: %d\n",
+              sum(smeta$class == "Blank", na.rm = TRUE),
+              sum(smeta$class == "N",     na.rm = TRUE),
+              sum(smeta$class == "T",     na.rm = TRUE),
+              sum(smeta$class == "QC",    na.rm = TRUE),
+              sum(!smeta$class %in% c("Blank", "N", "T", "QC"), na.rm = TRUE)))
+
+  # Feature metadata (annotation columns)
+  feat_raw <- raw[6:nrow(raw), 1:n_annot]
+  names(feat_raw) <- headers[1:n_annot]
+  feat_meta <- feat_raw %>%
+    mutate(
+      alignment_id = as.integer(`Alignment ID`),
+      rt_min       = as.numeric(`Average Rt(min)`),
+      mz           = as.numeric(`Average Mz`),
+      metabolite   = `Metabolite name`,
+      adduct       = `Adduct type`,
+      fill_pct     = as.numeric(`Fill %`),
+      ms2_assigned = (`MS/MS assigned` == "true" | `MS/MS assigned` == "TRUE"),
+      formula      = Formula,
+      ontology     = Ontology,
+      mode         = mode_label
+    ) %>%
+    select(alignment_id, rt_min, mz, metabolite, adduct, fill_pct,
+           ms2_assigned, formula, ontology, mode)
+
+  # Feature × sample intensity matrix
+  area_raw <- raw[6:nrow(raw), sample_cols]
+  area_mat <- apply(area_raw, 2, as.numeric)
+  rownames(area_mat) <- feat_meta$alignment_id
+  colnames(area_mat) <- smeta$col_name
+  cat(sprintf("  Feature matrix: %d features x %d samples\n",
+              nrow(area_mat), ncol(area_mat)))
+
+  smeta <- smeta %>%
+    mutate(
+      lab_id         = str_extract(col_name, "CMCL-HT-A\\d+"),
+      is_reinjection = str_detect(col_name, "_1$")
+    )
+
+  list(feature_meta = feat_meta, sample_meta = smeta,
+       area_matrix  = area_mat,  mode        = mode_label)
+}
+```
+
+Run the parser on all 4 modes:
+
+```{r run-parse-all, cache=TRUE}
+datasets <- list()
+for (mode_name in names(msdial_files)) {
+  datasets[[mode_name]] <- parse_msdial(msdial_files[[mode_name]],
+                                         mode_label = mode_name)
+}
+saveRDS(datasets, file.path(paths$results, "01_raw_parsed_datasets.rds"))
+```
+
+---
+
+# 3. Reinjection handling
+
+When samples are re-acquired due to an initial failed injection, MS-DIAL
+labels the second injection with a `_1` suffix. Keep the reinjection (newer
+run) and drop the original.
+
+```{r handle-reinjections}
+handle_reinjections <- function(ds) {
+  smeta <- ds$sample_meta
+  area  <- ds$area_matrix
+
+  reinj <- smeta %>% filter(is_reinjection)
+  if (nrow(reinj) == 0) return(ds)
+
+  cat(sprintf("  %s: %d reinjections found\n", ds$mode, nrow(reinj)))
+
+  for (i in seq_len(nrow(reinj))) {
+    orig_lab_id <- reinj$lab_id[i]
+    orig_idx    <- which(smeta$lab_id == orig_lab_id & !smeta$is_reinjection)
+    if (length(orig_idx) == 1) {
+      orig_colname <- smeta$col_name[orig_idx]
+      smeta <- smeta[-orig_idx, ]
+      area  <- area[, colnames(area) != orig_colname, drop = FALSE]
+    }
+  }
+  smeta$is_reinjection <- FALSE
+  ds$sample_meta <- smeta
+  ds$area_matrix <- area
+  ds
+}
+datasets <- lapply(datasets, handle_reinjections)
+```
+
+---
+
+# 4. QC-based filtering
+
+Sequential filters to remove unreliable features:
+
+1. **Blank subtraction** — retain features with biological mean > 3 × blank mean
+2. **Fill %** — retain features detected in ≥ 10% of samples
+3. **Missing value** — retain features with < 50% missing in biological samples
+4. **RSD < 30%** in pooled QC samples
+
+```{r qc-filter-fn}
+qc_filter <- function(ds, rsd_thresh = 30, mv_thresh = 50,
+                       blank_ratio = 3, min_fill = 0.1) {
+
+  mode_lab <- ds$mode
+  feat     <- ds$feature_meta
+  smeta    <- ds$sample_meta
+  area     <- ds$area_matrix
+  n_start  <- nrow(feat)
+  cat(sprintf("\n--- %s: %d features ---\n", mode_lab, n_start))
+
+  blank_cols <- smeta$col_name[smeta$class == "Blank"]
+  qc_cols    <- smeta$col_name[smeta$class == "QC"]
+  bio_cols   <- smeta$col_name[smeta$class %in% c("N", "T", "Sample")]
+  na_cols    <- smeta$col_name[smeta$class == "NA" & !is.na(smeta$lab_id)]
+  bio_cols   <- c(bio_cols, na_cols)
+
+  # 4a. Blank subtraction
+  mean_blank <- rowMeans(area[, blank_cols, drop = FALSE], na.rm = TRUE)
+  mean_bio   <- rowMeans(area[, bio_cols,   drop = FALSE], na.rm = TRUE)
+  mean_blank[is.nan(mean_blank)] <- 0
+  mean_bio[is.nan(mean_bio)]     <- 0
+  keep_blank <- mean_bio > (blank_ratio * mean_blank) | mean_blank == 0
+  area <- area[keep_blank, , drop = FALSE]; feat <- feat[keep_blank, ]
+  cat(sprintf("  Blank filter:        %d -> %d\n", n_start, nrow(feat)))
+
+  # 4b. Fill %
+  keep_fill <- feat$fill_pct >= min_fill
+  area <- area[keep_fill, , drop = FALSE]; feat <- feat[keep_fill, ]
+  cat(sprintf("  Fill %% filter:       %d features\n", nrow(feat)))
+
+  # 4c. Missing values
+  bio_area <- area[, bio_cols, drop = FALSE]
+  mv_pct   <- rowMeans(is.na(bio_area) | bio_area == 0) * 100
+  keep_mv  <- mv_pct < mv_thresh
+  area <- area[keep_mv, , drop = FALSE]; feat <- feat[keep_mv, ]
+  cat(sprintf("  MV filter (< %d%%):    %d features\n", mv_thresh, nrow(feat)))
+
+  # 4d. RSD in QC
+  rsd      <- calc_rsd(area[, qc_cols, drop = FALSE])
+  rsd[is.na(rsd)] <- Inf
+  keep_rsd <- rsd < rsd_thresh
+  feat$rsd_qc <- rsd
+  area <- area[keep_rsd, , drop = FALSE]; feat <- feat[keep_rsd, ]
+  cat(sprintf("  RSD filter (< %d%%):   %d features\n", rsd_thresh, nrow(feat)))
+
+  cat(sprintf("  ** %s FINAL: %d features (%.1f%% of original) **\n",
+              mode_lab, nrow(feat), 100 * nrow(feat) / n_start))
+
+  ds$feature_meta <- feat
+  ds$area_matrix  <- area
+  ds$qc_summary   <- list(n_start = n_start, n_final = nrow(feat),
+                          rsd_values = rsd)
+  ds
+}
+datasets <- lapply(datasets, qc_filter)
+```
+
+---
+
+# 5. Probabilistic Quotient Normalisation (PQN)
+
+PQN (Dieterle et al., *Anal Chem* 2006) corrects for sample-to-sample dilution
+differences. The most-probable dilution factor is the median ratio of each
+sample's features to a reference spectrum.
+
+```{r pqn-norm}
+pqn_normalize <- function(area_mat, bio_cols) {
+  bio_area <- area_mat[, bio_cols, drop = FALSE]
+  bio_area[bio_area == 0] <- NA
+  reference <- apply(bio_area, 1, median, na.rm = TRUE)
+  norm_factors <- apply(bio_area, 2, function(x)
+                        median(x / reference, na.rm = TRUE))
+
+  norm_mat <- area_mat
+  for (j in seq_len(ncol(norm_mat))) {
+    cn <- colnames(norm_mat)[j]
+    if (cn %in% bio_cols) norm_mat[, j] <- area_mat[, j] / norm_factors[cn]
+  }
+  qc_cols_in <- setdiff(colnames(norm_mat), bio_cols)
+  global_factor <- median(norm_factors, na.rm = TRUE)
+  for (cn in qc_cols_in) norm_mat[, cn] <- area_mat[, cn] / global_factor
+
+  list(normalized = norm_mat, factors = norm_factors)
+}
+
+for (mode_name in names(datasets)) {
+  ds <- datasets[[mode_name]]
+  bio_cols <- ds$sample_meta$col_name[ds$sample_meta$class %in%
+                                        c("N", "T", "Sample", "NA")]
+  pqn <- pqn_normalize(ds$area_matrix, bio_cols)
+  datasets[[mode_name]]$area_norm   <- pqn$normalized
+  datasets[[mode_name]]$pqn_factors <- pqn$factors
+  cat(sprintf("  %s PQN factor range: %.3f – %.3f\n",
+              mode_name, min(pqn$factors), max(pqn$factors)))
+}
+saveRDS(datasets, file.path(paths$results, "02_filtered_normalized_datasets.rds"))
+```
+
+---
+
+# 6. Retention summary
+
+```{r retention-table}
+retention <- data.frame(
+  Mode       = names(datasets),
+  Raw        = sapply(datasets, function(d) d$qc_summary$n_start),
+  Retained   = sapply(datasets, function(d) d$qc_summary$n_final)
+) %>% mutate(Pct = round(100 * Retained / Raw, 2))
+
+kable(retention,
+      col.names = c("Mode", "Raw features", "Retained", "Retention (%)"),
+      caption = "Feature counts before and after QC filtering.")
+```
+
+---
+
+# 7. Paired-matrix construction
+
+Build a paired `N | T` sub-matrix per mode, indexed by the 3-digit patient ID.
+
+```{r build-paired}
+build_paired_matrix <- function(ds, pair_tbl) {
+  smeta <- ds$sample_meta; area <- ds$area_norm
+  if (is.null(area) || nrow(area) == 0)
+    return(list(pair_info = pair_tbl[0, ], n_pairs = 0))
+
+  get_colname <- function(lab_id) {
+    idx <- which(smeta$lab_id == lab_id)
+    if (length(idx) >= 1) return(smeta$col_name[idx[1]])
+    NA_character_
+  }
+  pair_tbl <- pair_tbl %>%
+    mutate(col_N = sapply(lab_id_N, get_colname),
+           col_T = sapply(lab_id_T, get_colname)) %>%
+    filter(!is.na(col_N) & !is.na(col_T))
+
+  area_N <- area[, pair_tbl$col_N, drop = FALSE]
+  area_T <- area[, pair_tbl$col_T, drop = FALSE]
+  colnames(area_N) <- pair_tbl$patient_id
+  colnames(area_T) <- pair_tbl$patient_id
+  list(pair_info = pair_tbl, area_N = area_N, area_T = area_T,
+       n_pairs = nrow(pair_tbl))
+}
+for (mode_name in names(datasets))
+  datasets[[mode_name]]$paired <- build_paired_matrix(datasets[[mode_name]],
+                                                       pair_table)
+```
+
+---
+
+# 8. QC-RLSC batch correction
+
+Feature-by-feature LOESS signal correction using QC-pool injections
+(Dunn et al., *Nat Protoc* 2011). The LOESS span is 0·75 (degree = 1,
+symmetric family); at least 5 non-missing QC observations are required per
+feature.
+
+For each feature:
+
+1. Fit a LOESS curve through the QC-pool injections
+2. Predict the drift value at every biological sample's injection order
+3. Correct: `corrected = raw × median(QC) / predicted_drift`
+
+```{r qc-rlsc-fn}
+qc_rlsc <- function(area_mat, smeta, span = 0.75, min_qc = 5) {
+
+  smeta_in <- smeta %>%
+    filter(col_name %in% colnames(area_mat)) %>%
+    arrange(inj_order)
+  qc_meta  <- smeta_in %>% filter(class == "QC")
+  all_meta <- smeta_in
+  qc_cols  <- qc_meta$col_name
+  qc_inj   <- qc_meta$inj_order
+
+  if (length(qc_cols) < min_qc) {
+    warning("Too few QC samples.")
+    return(list(corrected = area_mat, n_corrected = 0,
+                n_skipped = nrow(area_mat)))
+  }
+
+  corrected   <- area_mat
+  n_corrected <- 0
+  n_skipped   <- 0
+
+  for (i in seq_len(nrow(area_mat))) {
+    qc_vals <- as.numeric(area_mat[i, qc_cols])
+    valid   <- !is.na(qc_vals) & qc_vals > 0
+    if (sum(valid) < min_qc) { n_skipped <- n_skipped + 1; next }
+
+    fit_data <- data.frame(inj = qc_inj[valid], val = qc_vals[valid])
+    loess_fit <- tryCatch(
+      loess(val ~ inj, data = fit_data, span = span,
+            degree = 1, family = "symmetric"),
+      error = function(e) NULL
+    )
+    if (is.null(loess_fit)) { n_skipped <- n_skipped + 1; next }
+
+    predicted <- predict(loess_fit,
+                         newdata = data.frame(inj = all_meta$inj_order))
+    qc_median <- median(qc_vals[valid])
+
+    # Vectorised correction
+    valid_pred <- !is.na(predicted) & predicted > 0
+    cols_to_correct <- all_meta$col_name[valid_pred]
+    corrected[i, cols_to_correct] <-
+      area_mat[i, cols_to_correct] * qc_median / predicted[valid_pred]
+
+    n_corrected <- n_corrected + 1
+  }
+  list(corrected = corrected, n_corrected = n_corrected,
+       n_skipped = n_skipped)
+}
+```
+
+Apply the correction to all four modes:
+
+```{r run-qc-rlsc, cache=TRUE}
+for (mode_name in names(datasets)) {
+  ds <- datasets[[mode_name]]
+  if (is.null(ds$area_norm) || nrow(ds$area_norm) == 0) next
+
+  cat(sprintf("\n--- %s ---\n", mode_name))
+  result <- qc_rlsc(ds$area_norm, ds$sample_meta, span = 0.75, min_qc = 5)
+  cat(sprintf("  Corrected: %d | Skipped: %d\n",
+              result$n_corrected, result$n_skipped))
+
+  datasets[[mode_name]]$area_pre_bc <- ds$area_norm
+  datasets[[mode_name]]$area_norm   <- result$corrected
+  datasets[[mode_name]]$bc_summary  <- list(n_corrected = result$n_corrected,
+                                             n_skipped   = result$n_skipped)
+}
+```
+
+---
+
+# 9. Batch-correction diagnostics
+
+## RSD: before vs after
+
+```{r rsd-before-after, fig.height=10}
+rsd_scatter_plots <- list()
+
+for (mode_name in names(datasets)) {
+  ds <- datasets[[mode_name]]
+  if (is.null(ds$area_norm) || nrow(ds$area_norm) == 0) next
+
+  qc_cols <- ds$sample_meta$col_name[ds$sample_meta$class == "QC"]
+  qc_cols <- intersect(qc_cols, colnames(ds$area_norm))
+
+  rsd_pre  <- calc_rsd(ds$area_pre_bc[, qc_cols, drop = FALSE])
+  rsd_post <- calc_rsd(ds$area_norm[,   qc_cols, drop = FALSE])
+
+  df <- data.frame(rsd_before = rsd_pre, rsd_after = rsd_post) %>%
+    filter(!is.na(rsd_before) & !is.na(rsd_after))
+  improved <- round(100 * mean(df$rsd_after < df$rsd_before, na.rm = TRUE))
+
+  rsd_scatter_plots[[mode_name]] <- ggplot(df,
+      aes(x = rsd_before, y = rsd_after)) +
+    geom_point(alpha = 0.3, size = 0.8, color = "#2166ac") +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    coord_cartesian(xlim = c(0, 50), ylim = c(0, 50)) +
+    labs(title = sprintf("%s (%d%% improved)", mode_name, improved),
+         x = "RSD before (%)", y = "RSD after (%)") +
+    theme_bw(base_size = 11)
+}
+fig_rsd <- wrap_plots(rsd_scatter_plots, ncol = 2) +
+  plot_annotation(
+    title    = "QC-RLSC batch correction: RSD before vs after",
+    subtitle = "Points below red line = improvement"
+  )
+save_fig(fig_rsd, "02C_RSD_before_after_correction", width = 12, height = 10)
+fig_rsd
+```
+
+## PCA: before vs after
+
+```{r pca-before-after, fig.height=14}
+pca_compare_plots <- list()
+
+for (mode_name in names(datasets)) {
+  ds <- datasets[[mode_name]]
+  if (is.null(ds$area_norm) || nrow(ds$area_norm) == 0) next
+
+  smeta <- ds$sample_meta
+  use_cols <- intersect(
+    smeta$col_name[smeta$class %in% c("N", "T", "QC")],
+    colnames(ds$area_norm)
+  )
+
+  for (stage in c("Before", "After")) {
+    mat_src <- if (stage == "Before") ds$area_pre_bc else ds$area_norm
+    mat     <- t(mat_src[, use_cols, drop = FALSE])
+
+    # Impute 0/NA with column half-min
+    mat[is.na(mat) | mat == 0] <- NA
+    for (j in seq_len(ncol(mat))) {
+      na_idx <- is.na(mat[, j])
+      if (any(na_idx) & any(!na_idx))
+        mat[na_idx, j] <- min(mat[!na_idx, j]) / 2
+    }
+    feat_var <- apply(mat, 2, var, na.rm = TRUE)
+    mat <- mat[, feat_var > 0, drop = FALSE]
+    mat <- log2(mat + 1)
+
+    pca_res <- prcomp(mat, center = TRUE, scale. = TRUE)
+    classes <- smeta$class[match(rownames(mat), smeta$col_name)]
+    var_exp <- summary(pca_res)$importance[2, 1:2] * 100
+
+    pca_df <- data.frame(PC1 = pca_res$x[, 1], PC2 = pca_res$x[, 2],
+                          Class = classes)
+    p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Class)) +
+      geom_point(alpha = 0.6, size = 1.5) +
+      scale_color_manual(values = c("N" = "#2166ac", "T" = "#b2182b",
+                                     "QC" = "#4daf4a")) +
+      labs(title = sprintf("%s — %s", mode_name, stage),
+           x = sprintf("PC1 (%.1f%%)", var_exp[1]),
+           y = sprintf("PC2 (%.1f%%)", var_exp[2])) +
+      theme_bw(base_size = 10) +
+      theme(legend.position = "bottom")
+    pca_compare_plots[[paste0(mode_name, "_", stage)]] <- p
+  }
+}
+if (length(pca_compare_plots) >= 2) {
+  fig_pca <- wrap_plots(pca_compare_plots, ncol = 2) +
+    plot_annotation(title = "PCA: before vs after QC-RLSC correction")
+  save_fig(fig_pca, "02E_PCA_before_after_correction",
+           width = 14, height = 18)
+}
+```
+
+---
+
+# 10. D-ratio assessment
+
+D-ratio = SD(QC) / SD(biological). Values < 0·5 indicate that analytical
+variation is well below biological variation for a feature.
+
+```{r dratio-assessment}
+dratio_summary <- list()
+for (mode_name in names(datasets)) {
+  ds <- datasets[[mode_name]]
+  if (is.null(ds$area_norm) || nrow(ds$area_norm) == 0) next
+
+  qc_cols  <- intersect(ds$sample_meta$col_name[ds$sample_meta$class == "QC"],
+                        colnames(ds$area_norm))
+  bio_cols <- intersect(
+    ds$sample_meta$col_name[ds$sample_meta$class %in% c("N", "T", "Sample", "NA")],
+    colnames(ds$area_norm)
+  )
+  d_post <- calc_dratio(ds$area_norm[,   qc_cols, drop = FALSE],
+                        ds$area_norm[,   bio_cols, drop = FALSE])
+  d_pre  <- calc_dratio(ds$area_pre_bc[, qc_cols, drop = FALSE],
+                        ds$area_pre_bc[, bio_cols, drop = FALSE])
+
+  datasets[[mode_name]]$dratio        <- d_post
+  datasets[[mode_name]]$dratio_pre_bc <- d_pre
+
+  dratio_summary[[mode_name]] <- data.frame(
+    Mode = mode_name,
+    D_ratio_pre  = round(median(d_pre,  na.rm = TRUE), 3),
+    D_ratio_post = round(median(d_post, na.rm = TRUE), 3),
+    Pct_lt_0.5_post = round(100 * mean(d_post < 0.5, na.rm = TRUE), 1)
+  )
+}
+kable(do.call(rbind, dratio_summary),
+      row.names = FALSE,
+      caption = "Median D-ratio before and after QC-RLSC, with percentage of features meeting the < 0·5 criterion after correction.")
+```
+
+---
+
+# 11. Rebuild paired matrices using corrected data
+
+```{r rebuild-paired}
+for (mode_name in names(datasets)) {
+  ds <- datasets[[mode_name]]
+  if (is.null(ds$area_norm) || nrow(ds$area_norm) == 0) next
+  pt <- ds$paired$pair_info
+  if (nrow(pt) == 0) next
+  area_N <- ds$area_norm[, pt$col_N, drop = FALSE]
+  area_T <- ds$area_norm[, pt$col_T, drop = FALSE]
+  colnames(area_N) <- pt$patient_id
+  colnames(area_T) <- pt$patient_id
+  datasets[[mode_name]]$paired$area_N <- area_N
+  datasets[[mode_name]]$paired$area_T <- area_T
+}
+```
+
+---
+
+# 12. Save final datasets
+
+```{r save-final}
+saveRDS(datasets, file.path(paths$results,
+                             "02_filtered_normalized_datasets.rds"))
+saveRDS(datasets, file.path(paths$results,
+                             "02b_batch_corrected_datasets.rds"))
+
+bc_summary <- data.frame(
+  Mode      = names(datasets),
+  Features  = sapply(datasets, function(d)
+                 if (is.null(d$area_norm)) 0 else nrow(d$area_norm)),
+  Corrected = sapply(datasets, function(d)
+                 if (is.null(d$bc_summary)) 0 else d$bc_summary$n_corrected),
+  Skipped   = sapply(datasets, function(d)
+                 if (is.null(d$bc_summary)) 0 else d$bc_summary$n_skipped)
+)
+write.csv(bc_summary,
+          file.path(paths$tables, "batch_correction_summary.csv"),
+          row.names = FALSE)
+kable(bc_summary,
+      caption = "Batch-correction outcome: number of features corrected vs. skipped per mode.")
+```
+
+---
+
+# Outputs
+
+| File | Description |
+|------|-------------|
+| `output/results/02b_batch_corrected_datasets.rds` | **Primary input** for `02_statistics.Rmd` |
+| `output/tables/batch_correction_summary.csv` | Per-mode correction counts |
+| `output/figures/02C_RSD_before_after_correction.pdf/png` | RSD improvement scatter |
+| `output/figures/02E_PCA_before_after_correction.pdf/png` | PCA before vs. after correction |
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

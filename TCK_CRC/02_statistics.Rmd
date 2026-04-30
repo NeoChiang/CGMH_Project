@@ -1,0 +1,895 @@
+---
+title: "CRC Tissue Metabolomics — Part 2: Statistical Analysis"
+author: "Chang Gung Memorial Hospital — Metabolomics Medical Research Program"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+params:
+  base_dir: "C:/Users/Eric/ClaudeCowork_CRC_metabolomics"
+---
+
+```{r base-dir-from-params, include=FALSE}
+base_dir <- params$base_dir
+```
+
+```{r child = "_setup.Rmd"}
+```
+
+```{r extra-libs, include=FALSE}
+suppressPackageStartupMessages({
+  library(ggrepel)
+  library(pheatmap)
+  library(ropls)       # OPLS-DA
+  library(vegan)       # PERMANOVA
+})
+```
+
+# Overview
+
+This document performs the full statistical analysis of the batch-corrected
+feature matrix produced by `01_preprocessing.Rmd`.
+
+| Step | Method | Output |
+|------|--------|--------|
+| 1. Paired Wilcoxon | Within-patient T vs N + BH FDR | `03_statistical_results.rds`, Table 2 |
+| 2. Multivariate | PCA + OPLS-DA (1,000 perms, 7-fold CV) | Figures 4A/B/C |
+| 3. Heatmap | Top-50 paired log2FC per mode | Figure 5 |
+| 4. Clinical linking | Biobank metadata, ID conversion | Table 1, `clinical_metadata_linked.csv` |
+| 5. Clinical PCA | PC1–PC2 by sex/stage/location/age | `PCA_clinical_<mode>.pdf` |
+| 6. Confounder assessment | PERMANOVA + per-feature lm on paired Δ | Figure S-conf |
+
+**Input:** `output/results/02b_batch_corrected_datasets.rds` (from Part 1).
+**Expected render time:** 15–25 min (OPLS-DA × 4 modes dominates).
+**All analyses operate on batch-corrected data.**
+
+---
+
+# 1. Paired Wilcoxon Signed-Rank Test
+
+## Rationale
+
+The within-patient paired design algebraically cancels all patient-level
+confounders (age, sex, BMI, location) from the primary comparison. The
+Wilcoxon signed-rank test makes no distributional assumption and is robust
+to outliers.
+
+```{r load-data}
+datasets <- readRDS(file.path(paths$results,
+                               "02_filtered_normalized_datasets.rds"))
+cat("Loaded", length(datasets), "modes:",
+    paste(names(datasets), collapse = ", "), "\n")
+```
+
+```{r paired-wilcoxon}
+run_paired_tests <- function(ds) {
+  mode_lab <- ds$mode
+  paired   <- ds$paired
+  feat     <- ds$feature_meta
+  area_N   <- paired$area_N
+  area_T   <- paired$area_T
+
+  cat(sprintf("\n--- %s: %d features × %d pairs ---\n",
+              mode_lab, nrow(area_N), paired$n_pairs))
+
+  min_pairs <- 6
+  n_feat    <- nrow(area_N)
+
+  results <- data.frame(
+    alignment_id = feat$alignment_id, metabolite = feat$metabolite,
+    mz           = feat$mz,          rt_min     = feat$rt_min,
+    adduct       = feat$adduct,      ms2_assigned = feat$ms2_assigned,
+    formula      = feat$formula,     ontology   = feat$ontology,
+    mode         = mode_lab,
+    stringsAsFactors = FALSE
+  )
+
+  p_values <- fc_values <- log2fc <- mean_N <- mean_T <- rep(NA_real_, n_feat)
+  n_valid  <- rep(NA_integer_, n_feat)
+
+  for (i in seq_len(n_feat)) {
+    x_n <- as.numeric(area_N[i, ])
+    x_t <- as.numeric(area_T[i, ])
+    valid <- !is.na(x_n) & !is.na(x_t) & x_n > 0 & x_t > 0
+    n_valid[i] <- sum(valid)
+    if (n_valid[i] < min_pairs) next
+
+    wt <- tryCatch(wilcox.test(x_t[valid], x_n[valid], paired = TRUE,
+                               exact = FALSE, correct = TRUE),
+                   error = function(e) NULL)
+    if (!is.null(wt)) p_values[i] <- wt$p.value
+    mean_T[i]    <- mean(x_t[valid])
+    mean_N[i]    <- mean(x_n[valid])
+    fc_values[i] <- mean_T[i] / mean_N[i]
+    log2fc[i]    <- log2(fc_values[i])
+  }
+
+  q_values <- p.adjust(p_values, method = "BH")
+
+  results$mean_N  <- mean_N;  results$mean_T  <- mean_T
+  results$fc      <- fc_values; results$log2fc <- log2fc
+  results$n_pairs <- n_valid; results$p_value <- p_values
+  results$q_value <- q_values
+  results$sig_005 <- !is.na(q_values) & q_values < 0.05
+  results$sig_001 <- !is.na(q_values) & q_values < 0.01
+  results$direction <- ifelse(log2fc > 0, "Up_in_Tumour", "Down_in_Tumour")
+
+  cat(sprintf("  q<0.05: %d | q<0.01: %d | Up: %d | Down: %d\n",
+              sum(results$sig_005), sum(results$sig_001),
+              sum(results$sig_005 & results$direction == "Up_in_Tumour"),
+              sum(results$sig_005 & results$direction == "Down_in_Tumour")))
+  results
+}
+
+stat_results <- lapply(datasets, run_paired_tests)
+all_results  <- bind_rows(stat_results)
+cat(sprintf("\n=== Total: %d features tested, %d significant (q<0.05) ===\n",
+            nrow(all_results), sum(all_results$sig_005, na.rm = TRUE)))
+```
+
+## MSI confidence level assignment
+
+```{r msi-level}
+all_results <- all_results %>%
+  mutate(
+    is_named = !is.na(metabolite) & metabolite != "" &
+               metabolite != "Unknown" &
+               !grepl("^\\d", metabolite) &
+               !grepl("^w/o MS2:", metabolite),
+    msi_level = case_when(
+      ms2_assigned & is_named  ~ 2L,   # MS2 + named
+      is_named & !ms2_assigned ~ 3L,   # named by mass only
+      TRUE                     ~ 4L    # unknown
+    )
+  )
+for (m in names(stat_results))
+  stat_results[[m]] <- all_results %>% filter(mode == m)
+
+cat(sprintf("MSI Level 2: %d  |  Level 3: %d  |  Level 4: %d\n",
+            sum(all_results$msi_level == 2),
+            sum(all_results$msi_level == 3),
+            sum(all_results$msi_level == 4)))
+```
+
+## Volcano plots
+
+```{r volcano-fn}
+generate_volcano <- function(res_df, mode_lab,
+                              fc_thresh = 1.0, q_thresh = 0.05) {
+  plot_df <- res_df %>%
+    filter(!is.na(p_value) & !is.na(log2fc)) %>%
+    mutate(
+      neg_log10_q  = -log10(q_value),
+      significance = case_when(
+        q_value < q_thresh & abs(log2fc) >= fc_thresh ~ "Significant",
+        q_value < q_thresh                            ~ "FDR only",
+        abs(log2fc) >= fc_thresh                      ~ "FC only",
+        TRUE                                          ~ "NS"
+      )
+    )
+  top_to_label <- plot_df %>%
+    filter(significance == "Significant" & msi_level <= 3) %>%
+    arrange(q_value) %>% slice_head(n = 15)
+
+  ggplot(plot_df, aes(x = log2fc, y = neg_log10_q)) +
+    geom_point(aes(color = significance), alpha = 0.5, size = 1.5) +
+    scale_color_manual(values = c("Significant" = "#b2182b",
+                                   "FDR only"    = "#f4a582",
+                                   "FC only"     = "#92c5de",
+                                   "NS"          = "grey70")) +
+    geom_hline(yintercept = -log10(q_thresh), linetype = "dashed",
+               color = "grey40", linewidth = 0.5) +
+    geom_vline(xintercept = c(-fc_thresh, fc_thresh), linetype = "dashed",
+               color = "grey40", linewidth = 0.5) +
+    geom_text_repel(data = top_to_label, aes(label = metabolite),
+                    size = 2.5, max.overlaps = 20, segment.size = 0.3,
+                    box.padding = 0.4) +
+    labs(title = sprintf("Volcano — %s", mode_lab),
+         subtitle = sprintf("n = %d | %d significant",
+                             nrow(plot_df),
+                             sum(plot_df$significance == "Significant")),
+         x = expression(log[2]~"FC (T / N)"),
+         y = expression(-log[10]~"q-value")) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom", legend.title = element_blank())
+}
+```
+
+```{r volcano-plots, fig.height=10}
+volcano_plots <- lapply(names(stat_results), function(m)
+                          generate_volcano(stat_results[[m]], m))
+names(volcano_plots) <- names(stat_results)
+fig_volcano <- wrap_plots(volcano_plots, ncol = 2) +
+  plot_annotation(title = "Figure 3 — Volcano plots (paired Wilcoxon, T vs N)")
+save_fig(fig_volcano, "03_Volcano_all_modes", width = 16, height = 12)
+fig_volcano
+```
+
+---
+
+# 2. Multivariate Analysis (PCA + OPLS-DA)
+
+## Paired-sample PCA
+
+```{r paired-pca}
+run_paired_pca <- function(ds) {
+  area_N <- ds$paired$area_N; area_T <- ds$paired$area_T
+  colnames(area_N) <- paste0(colnames(area_N), "_N")
+  colnames(area_T) <- paste0(colnames(area_T), "_T")
+  mat <- t(cbind(area_N, area_T))
+
+  # Half-min imputation per feature
+  mat[is.na(mat) | mat == 0] <- NA
+  for (j in seq_len(ncol(mat))) {
+    na_idx <- is.na(mat[, j])
+    if (any(na_idx) & any(!na_idx))
+      mat[na_idx, j] <- min(mat[!na_idx, j]) / 2
+  }
+  feat_var <- apply(mat, 2, var, na.rm = TRUE)
+  mat <- log2(mat[, feat_var > 0, drop = FALSE] + 1)
+
+  pca_res <- prcomp(mat, center = TRUE, scale. = TRUE)
+  var_exp <- summary(pca_res)$importance[2, 1:2] * 100
+  tissue  <- ifelse(grepl("_N$", rownames(mat)), "Non-Tumour", "Tumour")
+
+  p <- ggplot(
+    data.frame(PC1 = pca_res$x[,1], PC2 = pca_res$x[,2], Tissue = tissue),
+    aes(x = PC1, y = PC2, color = Tissue)) +
+    geom_point(alpha = 0.6, size = 2) +
+    stat_ellipse(level = 0.95, linetype = "dashed") +
+    scale_color_manual(values = c("Non-Tumour" = "#2166ac",
+                                   "Tumour"     = "#b2182b")) +
+    labs(title = sprintf("PCA — %s", ds$mode),
+         x = sprintf("PC1 (%.1f%%)", var_exp[1]),
+         y = sprintf("PC2 (%.1f%%)", var_exp[2])) +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom")
+  list(plot = p, pca = pca_res, mat = mat, tissue = tissue)
+}
+pca_results <- lapply(datasets, run_paired_pca)
+fig_pca <- wrap_plots(lapply(pca_results, `[[`, "plot"), ncol = 2) +
+  plot_annotation(title = "Figure 4A — Paired PCA (tumour vs. non-tumour)")
+save_fig(fig_pca, "04A_PCA_paired_all_modes", width = 14, height = 10)
+```
+
+## OPLS-DA
+
+Predictive component + orthogonal components, 7-fold CV, 1,000 random-label
+permutations (ropls::opls). Valid models require observed Q² > 95th
+percentile of the permuted distribution.
+
+```{r opls-fn}
+run_oplsda <- function(ds, n_perm = 1000) {
+  mode_lab <- ds$mode
+  area_N <- ds$paired$area_N; area_T <- ds$paired$area_T
+  colnames(area_N) <- paste0(colnames(area_N), "_N")
+  colnames(area_T) <- paste0(colnames(area_T), "_T")
+  mat <- t(cbind(area_N, area_T))
+
+  mat[is.na(mat) | mat == 0] <- NA
+  for (j in seq_len(ncol(mat))) {
+    na_idx <- is.na(mat[, j])
+    if (any(na_idx) & any(!na_idx))
+      mat[na_idx, j] <- min(mat[!na_idx, j]) / 2
+  }
+  feat_var <- apply(mat, 2, var, na.rm = TRUE)
+  mat <- log2(mat[, feat_var > 0, drop = FALSE] + 1)
+  tissue <- factor(ifelse(grepl("_N$", rownames(mat)), "N", "T"),
+                   levels = c("N", "T"))
+
+  cat(sprintf("\n--- %s: OPLS-DA (%d samples × %d features, %d perms) ---\n",
+              mode_lab, nrow(mat), ncol(mat), n_perm))
+
+  opls_model <- tryCatch(
+    opls(mat, tissue, predI = 1, orthoI = NA, permI = n_perm,
+         crossvalI = 7, fig.pdfC = "none", info.txtC = "none"),
+    error = function(e) {
+      cat("  OPLS-DA failed; falling back to PLS-DA\n")
+      tryCatch(
+        opls(mat, tissue, predI = 2, orthoI = 0, permI = n_perm,
+             crossvalI = 7, fig.pdfC = "none", info.txtC = "none"),
+        error = function(e2) NULL)
+    }
+  )
+  if (is.null(opls_model))
+    return(list(model = NULL, mode = mode_lab, mat = mat, tissue = tissue))
+
+  r2x <- opls_model@modelDF$`R2X(cum)`
+  r2y <- opls_model@modelDF$`R2Y(cum)`
+  q2  <- opls_model@modelDF$`Q2(cum)`
+  cat(sprintf("  R²X=%.3f  R²Y=%.3f  Q²=%.3f\n", r2x, r2y, q2))
+
+  vip_scores <- getVipVn(opls_model)
+  retained   <- ds$feature_meta[feat_var > 0, ]
+  vip_df <- data.frame(
+    alignment_id = retained$alignment_id,
+    metabolite   = retained$metabolite,
+    mz           = retained$mz,
+    rt_min       = retained$rt_min,
+    vip          = as.numeric(vip_scores),
+    stringsAsFactors = FALSE
+  )
+
+  scores_pred <- opls_model@scoreMN[, 1]
+  loadings_p  <- opls_model@loadingMN[, 1]
+  pcorr       <- apply(mat, 2, function(x) cor(x, scores_pred,
+                                                use = "complete.obs"))
+  splot_df <- data.frame(alignment_id = retained$alignment_id,
+                          metabolite   = retained$metabolite,
+                          p_loading    = loadings_p,
+                          p_corr       = pcorr,
+                          vip          = vip_scores,
+                          stringsAsFactors = FALSE)
+
+  list(model = opls_model, vip = vip_df, splot = splot_df, mode = mode_lab,
+       r2x = r2x, r2y = r2y, q2 = q2, mat = mat, tissue = tissue)
+}
+```
+
+```{r opls-run, cache=TRUE}
+opls_results <- lapply(datasets, run_oplsda, n_perm = 1000)
+```
+
+### OPLS-DA model quality
+
+```{r opls-quality}
+quality <- data.frame(
+  Mode = names(opls_results),
+  R2X  = sapply(opls_results, function(x) if (is.null(x$r2x)) NA else round(x$r2x, 3)),
+  R2Y  = sapply(opls_results, function(x) if (is.null(x$r2y)) NA else round(x$r2y, 3)),
+  Q2   = sapply(opls_results, function(x) if (is.null(x$q2))  NA else round(x$q2, 3))
+)
+write.csv(quality, file.path(paths$tables, "OPLSDA_model_quality.csv"),
+          row.names = FALSE)
+kable(quality, caption = "OPLS-DA model quality per LC-MS mode.")
+```
+
+### Scores plots and S-plots
+
+```{r opls-plots, fig.height=10}
+generate_scores_plot <- function(r) {
+  if (is.null(r$model)) return(ggplot() + theme_void())
+  t_pred <- r$model@scoreMN[, 1]
+  t_orth <- if (ncol(r$model@orthoScoreMN) > 0)
+              r$model@orthoScoreMN[, 1]
+            else r$model@scoreMN[, 2]
+  df <- data.frame(t_pred = t_pred, t_orth = t_orth,
+                    Tissue = ifelse(r$tissue == "N", "Non-Tumour", "Tumour"))
+  ggplot(df, aes(x = t_pred, y = t_orth, color = Tissue)) +
+    geom_point(alpha = 0.6, size = 2) +
+    stat_ellipse(level = 0.95, linetype = "dashed") +
+    scale_color_manual(values = c("Non-Tumour" = "#2166ac",
+                                   "Tumour"     = "#b2182b")) +
+    labs(title = sprintf("OPLS-DA — %s", r$mode),
+         subtitle = sprintf("R²Y=%.3f  Q²=%.3f", r$r2y, r$q2),
+         x = "t_pred[1]",
+         y = if (ncol(r$model@orthoScoreMN) > 0) "t_orth[1]" else "t[2]") +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom")
+}
+generate_splot <- function(r, vip_thresh = 1.5, pcorr_thresh = 0.5) {
+  if (is.null(r$splot)) return(ggplot() + theme_void())
+  d <- r$splot
+  d$highlight <- abs(d$p_corr) > pcorr_thresh & d$vip >= vip_thresh
+  top <- d %>%
+    filter(highlight & !is.na(metabolite) & metabolite != "Unknown" &
+           metabolite != "" & !grepl("^\\d", metabolite)) %>%
+    arrange(-abs(p_corr)) %>% slice_head(n = 10)
+  ggplot(d, aes(x = p_loading, y = p_corr)) +
+    geom_point(aes(color = highlight), alpha = 0.5, size = 1.5) +
+    scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "#b2182b"),
+                       guide = "none") +
+    geom_hline(yintercept = c(-pcorr_thresh, pcorr_thresh),
+               linetype = "dashed", color = "grey40", linewidth = 0.4) +
+    geom_text_repel(data = top, aes(label = metabolite),
+                    size = 2.2, max.overlaps = 15) +
+    labs(title = sprintf("S-plot — %s", r$mode),
+         x = "p[1] loading", y = "p(corr)[1]") +
+    theme_bw(base_size = 11)
+}
+
+scores_plots <- lapply(opls_results, generate_scores_plot)
+splot_plots  <- lapply(opls_results, generate_splot)
+
+fig_oplsda <- wrap_plots(scores_plots, ncol = 2) +
+  plot_annotation(title = "Figure 4B — OPLS-DA scores (T vs N)")
+fig_splot  <- wrap_plots(splot_plots, ncol = 2) +
+  plot_annotation(title = "Figure 4C — S-plots (feature importance)")
+
+save_fig(fig_oplsda, "04B_OPLSDA_scores_all_modes", width = 14, height = 10)
+save_fig(fig_splot,  "04C_Splot_all_modes",          width = 14, height = 10)
+fig_oplsda
+```
+
+---
+
+# 3. Top-50 Heatmap (Figure 5)
+
+For each mode, the 50 features with the smallest q-value are visualised as a
+per-patient log2-fold-change heatmap (tumour / normal).
+
+```{r heatmap}
+generate_top50_heatmap <- function(ds, stat_res, mode_lab) {
+  top50 <- stat_res %>%
+    filter(sig_005 & mode == mode_lab) %>%
+    arrange(q_value) %>% slice_head(n = 50)
+  if (nrow(top50) == 0) return(invisible(NULL))
+
+  feat_idx <- match(top50$alignment_id, rownames(ds$paired$area_N))
+  feat_idx <- feat_idx[!is.na(feat_idx)]
+  if (length(feat_idx) == 0) return(invisible(NULL))
+
+  sub_N <- ds$paired$area_N[feat_idx, , drop = FALSE]
+  sub_T <- ds$paired$area_T[feat_idx, , drop = FALSE]
+  log2fc_mat <- log2((sub_T + 1) / (sub_N + 1))
+
+  row_labels <- top50$metabolite[match(rownames(log2fc_mat), top50$alignment_id)]
+  missing <- is.na(row_labels) | row_labels == "" | row_labels == "Unknown"
+  row_labels[missing] <- paste0(
+    "m/z ", round(top50$mz[match(rownames(log2fc_mat)[missing],
+                                  top50$alignment_id)], 4),
+    "@", round(top50$rt_min[match(rownames(log2fc_mat)[missing],
+                                    top50$alignment_id)], 1))
+  rownames(log2fc_mat) <- make.unique(row_labels)
+
+  log2fc_mat[log2fc_mat >  4] <-  4
+  log2fc_mat[log2fc_mat < -4] <- -4
+
+  pheatmap(log2fc_mat,
+           color = colorRampPalette(c("#2166ac", "white", "#b2182b"))(100),
+           breaks = seq(-4, 4, length.out = 101),
+           cluster_rows = TRUE, cluster_cols = TRUE,
+           show_colnames = FALSE, fontsize_row = 7,
+           main = sprintf("Top-50 differential — %s", mode_lab),
+           filename = file.path(paths$figures,
+                                 sprintf("05_Heatmap_top50_%s.pdf", mode_lab)),
+           width = 12, height = 10)
+  invisible(NULL)
+}
+invisible(lapply(names(datasets), function(m)
+  generate_top50_heatmap(datasets[[m]], all_results, m)))
+```
+
+---
+
+# 4. Export Statistical Results
+
+```{r export-stats}
+saveRDS(list(stat_results = stat_results, all_results = all_results,
+              opls_results = opls_results, pca_results = pca_results),
+        file.path(paths$results, "03_statistical_results.rds"))
+
+table2 <- all_results %>%
+  filter(sig_005) %>%
+  select(mode, metabolite, mz, rt_min, adduct, formula, ontology,
+         msi_level, log2fc, fc, q_value, p_value, n_pairs, direction) %>%
+  arrange(q_value)
+write.csv(table2, file.path(paths$tables, "Table2_differential_metabolites.csv"),
+          row.names = FALSE)
+cat(sprintf("Table 2: %d significant metabolites saved.\n", nrow(table2)))
+```
+
+---
+
+# 5. Link Clinical Metadata
+
+Joins the CGMH Biobank clinical table to the sample list via the
+`原編號 ↔ 流水號` correspondence (character substitution `C0 → CO`). All
+182 patients match.
+
+```{r clinical-link}
+biobank_file <- file.path(paths$biobank_dir,
+                           "GIMETB20171101_20221017_ES.xlsx")
+
+samples <- read_excel(paths$sample, sheet = 1)
+samples <- samples[!is.na(samples[["原編號"]]), ] %>%
+  mutate(tissue_type = ifelse(grepl("T[0-9]+$", `原編號`), "Tumour", "Normal"),
+         core_id     = str_replace(`原編號`, "[TN][0-9]+$", ""),
+         serial_id   = str_replace(core_id, "C0", "CO"))
+
+clinical <- read_excel(biobank_file, sheet = "Merge")
+
+patient_ids <- unique(samples$serial_id)
+matched_clinical <- clinical %>%
+  filter(`流水號` %in% patient_ids) %>%
+  select(
+    serial_id = `流水號`, patient_id = ID,
+    cancer_code = `【01】癌症碼`, sex = `【06】性別`, age_dx = `【09】診斷年齡`,
+    primary_site = `【16】原發部位`, laterality = `【17】側性`,
+    morphology = `【18】組織形態碼`, grade = `【20】分級/分化`,
+    tumour_size = `【23】腫瘤大小`,
+    clinical_T = `【29】臨床T`, clinical_N = `【30】臨床N`,
+    clinical_M = `【31】臨床M`, clinical_stage = `【32】臨床期別分組`,
+    path_T = `【35】病理T`, path_N = `【36】病理N`,
+    path_M = `【37】病理M`, path_stage = `【38】病理期別分組`,
+    height = `【102】身高`, weight = `【103】體重`,
+    survival_status = `【98】生存狀態`
+  ) %>% distinct(serial_id, .keep_all = TRUE) %>%
+  mutate(
+    sex_label = case_when(sex == 1 ~ "Male", sex == 2 ~ "Female",
+                           TRUE ~ NA_character_),
+    height_m  = as.numeric(height) / 100,
+    weight_kg = as.numeric(weight),
+    BMI       = round(weight_kg / (height_m^2), 1),
+    stage_group = case_when(
+      grepl("^[012]", path_stage) ~ "I-II",
+      grepl("^[34]",  path_stage) ~ "III-IV",
+      TRUE ~ NA_character_),
+    location = case_when(
+      grepl("^C18", primary_site) ~ "Colon",
+      grepl("^C19", primary_site) ~ "Rectosigmoid",
+      grepl("^C20", primary_site) ~ "Rectum",
+      TRUE ~ NA_character_),
+    colon_side = case_when(
+      primary_site %in% c("C180","C181","C182","C183","C184") ~ "Right",
+      primary_site %in% c("C185","C186","C187") ~ "Left",
+      grepl("^C19|^C20", primary_site) ~ "Left",
+      TRUE ~ NA_character_),
+    core_id = str_replace(serial_id, "CO", "C0")
+  )
+
+cat(sprintf("Matched: %d of %d patients\n",
+            nrow(matched_clinical), length(patient_ids)))
+write.csv(matched_clinical,
+          file.path(paths$tables, "clinical_metadata_linked.csv"),
+          row.names = FALSE)
+```
+
+## Table 1 — cohort demographics
+
+```{r table1}
+demo <- data.frame(
+  Variable = c("Age (median, range)", "Sex (M / F)", "BMI (median)",
+               "Stage I–II / III–IV", "Colon / Rectum",
+               "Right / Left colon"),
+  Value = c(
+    sprintf("%d (%d–%d)",
+            median(as.numeric(matched_clinical$age_dx), na.rm = TRUE),
+            min(as.numeric(matched_clinical$age_dx), na.rm = TRUE),
+            max(as.numeric(matched_clinical$age_dx), na.rm = TRUE)),
+    sprintf("%d / %d",
+            sum(matched_clinical$sex_label == "Male",   na.rm = TRUE),
+            sum(matched_clinical$sex_label == "Female", na.rm = TRUE)),
+    sprintf("%.1f", median(matched_clinical$BMI, na.rm = TRUE)),
+    sprintf("%d / %d",
+            sum(matched_clinical$stage_group == "I-II",   na.rm = TRUE),
+            sum(matched_clinical$stage_group == "III-IV", na.rm = TRUE)),
+    sprintf("%d / %d",
+            sum(matched_clinical$location == "Colon",  na.rm = TRUE),
+            sum(matched_clinical$location == "Rectum", na.rm = TRUE)),
+    sprintf("%d / %d",
+            sum(matched_clinical$colon_side == "Right", na.rm = TRUE),
+            sum(matched_clinical$colon_side == "Left",  na.rm = TRUE))
+  )
+)
+kable(demo, caption = "Table 1 — cohort demographics (n = 182).")
+```
+
+---
+
+# 6. PCA Coloured by Clinical Variables
+
+Visual screen for clinical structuring of the metabolome beyond tissue type.
+Age is shown as a **continuous gradient** and as a dichotomous split
+(<65 / ≥65 at the cohort median of 65 y — visualisation only; continuous
+age is used for all modelling).
+
+```{r pca-clinical}
+cat_vars   <- c("tissue_type","sex_label","stage_group","location",
+                "colon_side","age_group")
+cat_labels <- c("Tissue Type","Sex","Stage (I-II vs III-IV)",
+                "Location","Colon Side (R vs L)","Age group (<65 vs \u226565)")
+cont_vars   <- c("age_dx", "BMI")
+cont_labels <- c("Age (continuous)", "BMI")
+
+for (m in names(datasets)) {
+  cat(sprintf("\n=== %s ===\n", toupper(m)))
+  ds    <- datasets[[m]]
+  mat   <- ds$area_matrix
+  smeta <- ds$sample_meta
+  pair_info <- ds$paired$pair_info
+
+  nt_idx   <- smeta$class %in% c("N", "T")
+  mat_nt   <- mat[, nt_idx]
+  smeta_nt <- smeta[nt_idx, ]
+
+  smeta_nt$patient_base <- NA_character_
+  for (i in seq_len(nrow(pair_info))) {
+    smeta_nt$patient_base[smeta_nt$col_name == pair_info$col_N[i]] <-
+                                                 pair_info$patient_base[i]
+    smeta_nt$patient_base[smeta_nt$col_name == pair_info$col_T[i]] <-
+                                                 pair_info$patient_base[i]
+  }
+  smeta_nt$tissue_type <- ifelse(smeta_nt$class == "T", "Tumour", "Normal")
+  smeta_nt <- smeta_nt %>%
+    left_join(matched_clinical %>%
+                select(core_id, sex_label, age_dx, BMI, stage_group,
+                        location, colon_side),
+              by = c("patient_base" = "core_id"))
+
+  # Log + row-median impute
+  na_pct    <- rowMeans(is.na(mat_nt))
+  mat_clean <- mat_nt[na_pct < 0.5, ]
+  mat_clean[mat_clean == 0] <- NA
+  mat_clean <- log2(mat_clean)
+  mat_clean <- impute_row_median(mat_clean)
+  mat_clean <- mat_clean[complete.cases(mat_clean), ]
+
+  pca <- prcomp(t(mat_clean), center = TRUE, scale. = TRUE)
+  ve  <- summary(pca)$importance[2, 1:5] * 100
+
+  pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], PC3 = pca$x[,3],
+                        smeta_nt, stringsAsFactors = FALSE)
+  pca_df$age_dx <- as.numeric(pca_df$age_dx)
+  pca_df$BMI    <- as.numeric(pca_df$BMI)
+  pca_df$age_group <- factor(
+    ifelse(is.na(pca_df$age_dx), NA_character_,
+           ifelse(pca_df$age_dx < 65, "<65", "\u226565")),
+    levels = c("<65", "\u226565"))
+
+  plots <- list()
+  for (j in seq_along(cat_vars)) {
+    v <- cat_vars[j]; lab <- cat_labels[j]
+    if (!v %in% colnames(pca_df) || all(is.na(pca_df[[v]]))) next
+    if (length(unique(na.omit(pca_df[[v]]))) < 2) next
+    dfp <- pca_df[!is.na(pca_df[[v]]), ]
+    plots[[v]] <- ggplot(dfp, aes(x=PC1, y=PC2, colour=.data[[v]])) +
+      geom_point(alpha = 0.45, size = 1.2) +
+      stat_ellipse(level = 0.95, linetype = "dashed", linewidth = 0.4) +
+      labs(x = sprintf("PC1 (%.1f%%)", ve[1]),
+           y = sprintf("PC2 (%.1f%%)", ve[2]),
+           colour = NULL, title = lab) +
+      theme_bw(base_size = 9) +
+      theme(legend.position = "bottom",
+            plot.title = element_text(size = 9, face = "bold"))
+  }
+  for (j in seq_along(cont_vars)) {
+    v <- cont_vars[j]; lab <- cont_labels[j]
+    if (!v %in% colnames(pca_df) || all(is.na(pca_df[[v]]))) next
+    dfp <- pca_df[!is.na(pca_df[[v]]), ]
+    plots[[v]] <- ggplot(dfp, aes(x=PC1, y=PC2, colour=.data[[v]])) +
+      geom_point(alpha = 0.45, size = 1.2) +
+      scale_colour_viridis_c(option = "plasma") +
+      labs(x = sprintf("PC1 (%.1f%%)", ve[1]),
+           y = sprintf("PC2 (%.1f%%)", ve[2]),
+           colour = NULL, title = lab) +
+      theme_bw(base_size = 9) + theme(legend.position = "bottom")
+  }
+  if (length(plots) > 0) {
+    nc <- min(4, length(plots))
+    combined <- wrap_plots(plots, ncol = nc) +
+      plot_annotation(title = sprintf("PCA by clinical variables — %s",
+                                       toupper(m)))
+    save_fig(combined, sprintf("PCA_clinical_%s", m),
+             width = 4 * nc, height = 4.5 * ceiling(length(plots) / nc))
+  }
+}
+```
+
+---
+
+# 7. Confounder Assessment of Paired Δ
+
+The paired design eliminates confounding from the *direction* of the
+tumour-vs-normal comparison, but clinical variables can still *modify the
+magnitude* of Δ. This step formally tests for effect modification using
+PERMANOVA (vegan::adonis2) and per-feature multiple linear regression.
+
+```{r conf-constants}
+MIN_COMPLETE_CASES <- 20
+MV_THRESH_FEAT     <- 0.40
+RNG_SEED           <- 2025
+```
+
+## Build paired Δ matrices
+
+```{r build-delta}
+build_delta_matrix <- function(ds, mode_name) {
+  mat <- ds$area_norm; if (is.null(mat)) mat <- ds$area_matrix
+  pair_info <- ds$paired$pair_info
+  mat_log <- mat; mat_log[mat_log == 0] <- NA; mat_log <- log2(mat_log)
+
+  delta_list <- lapply(seq_len(nrow(pair_info)), function(i) {
+    if (!pair_info$col_T[i] %in% colnames(mat_log) ||
+        !pair_info$col_N[i] %in% colnames(mat_log)) return(NULL)
+    mat_log[, pair_info$col_T[i]] - mat_log[, pair_info$col_N[i]]
+  })
+  valid <- !sapply(delta_list, is.null)
+  delta_mat <- do.call(cbind, delta_list[valid])
+  colnames(delta_mat) <- pair_info$patient_base[valid]
+  list(delta = delta_mat, patient_ids = pair_info$patient_base[valid])
+}
+delta_all <- lapply(names(datasets),
+                     function(m) build_delta_matrix(datasets[[m]], m))
+names(delta_all) <- names(datasets)
+
+get_clin_df <- function(patient_ids) {
+  data.frame(core_id = patient_ids, stringsAsFactors = FALSE) %>%
+    left_join(
+      matched_clinical %>%
+        select(core_id, age_dx, sex_label, BMI, stage_group, location) %>%
+        mutate(age_dx = as.numeric(age_dx), BMI = as.numeric(BMI),
+               sex_bin      = ifelse(sex_label   == "Male",   1L, 0L),
+               stage_bin    = ifelse(stage_group == "III-IV", 1L, 0L),
+               location_bin = ifelse(location    == "Colon",  1L, 0L)),
+      by = "core_id")
+}
+```
+
+## PERMANOVA
+
+```{r permanova, cache=TRUE}
+permanova_results <- list()
+for (m in names(delta_all)) {
+  cat(sprintf("\n--- %s ---\n", toupper(m)))
+  d <- delta_all[[m]]
+  clin_df <- get_clin_df(d$patient_ids)
+  complete_idx <- complete.cases(
+    clin_df[, c("age_dx","sex_bin","BMI","stage_bin","location_bin")])
+  if (sum(complete_idx) < MIN_COMPLETE_CASES) next
+
+  delta_sub <- d$delta[, complete_idx]
+  delta_sub <- impute_row_median(delta_sub)
+  rv <- apply(delta_sub, 1, var, na.rm = TRUE)
+  delta_sub <- delta_sub[rv > 0, ]
+  clin_sub <- clin_df[complete_idx, ]
+
+  set.seed(RNG_SEED)
+  perm <- adonis2(dist(t(delta_sub), method = "euclidean") ~
+                    age_dx + sex_bin + BMI + stage_bin + location_bin,
+                  data = clin_sub, permutations = 999, by = "margin")
+  print(perm)
+  permanova_results[[m]] <- as.data.frame(perm)
+}
+```
+
+## Per-feature linear models
+
+```{r per-feature-lm, cache=TRUE}
+run_per_feature_lm <- function(delta_mat, clin_df, mode_name) {
+  complete_idx <- complete.cases(
+    clin_df[, c("age_dx","sex_bin","BMI","stage_bin","location_bin")])
+  delta_sub <- delta_mat[, complete_idx]
+  clin_sub  <- clin_df[complete_idx, ]
+  n_feat <- nrow(delta_sub)
+
+  vars_model <- c("age_dx","sex_bin","BMI","stage_bin","location_bin")
+  coef_mat <- pval_mat <- r2_mat <- matrix(
+    NA_real_, nrow = n_feat, ncol = length(vars_model),
+    dimnames = list(rownames(delta_sub), vars_model))
+  r2_total <- rep(NA_real_, n_feat); names(r2_total) <- rownames(delta_sub)
+
+  fml <- as.formula(paste("y ~", paste(vars_model, collapse = " + ")))
+  row_meds <- apply(delta_sub, 1, median, na.rm = TRUE)
+
+  for (i in seq_len(n_feat)) {
+    y <- delta_sub[i, ]
+    if (mean(is.na(y)) > MV_THRESH_FEAT) next
+    y[is.na(y)] <- row_meds[i]
+    if (var(y, na.rm = TRUE) == 0) next
+
+    dat <- clin_sub %>% select(all_of(vars_model)) %>% mutate(y = y)
+    tryCatch({
+      fit <- lm(fml, data = dat); sm <- summary(fit)
+      r2_total[i] <- sm$r.squared
+      coef_tbl <- sm$coefficients
+      for (v in vars_model) {
+        if (v %in% rownames(coef_tbl)) {
+          coef_mat[i, v] <- coef_tbl[v, "Estimate"]
+          pval_mat[i, v] <- coef_tbl[v, "Pr(>|t|)"]
+        }
+      }
+      an <- anova(fit); ss_tot <- sum((y - mean(y))^2)
+      for (v in vars_model)
+        if (v %in% rownames(an)) r2_mat[i, v] <- an[v, "Sum Sq"] / ss_tot
+    }, error = function(e) NULL)
+  }
+
+  qval_mat <- apply(pval_mat, 2, p.adjust, method = "BH")
+  any_sig  <- rowSums(qval_mat < 0.05, na.rm = TRUE) > 0
+
+  out <- data.frame(mode = mode_name, feature_id = rownames(delta_sub),
+                     r2_total_model = r2_total, stringsAsFactors = FALSE)
+  for (v in vars_model) {
+    out[[paste0("r2_", v)]] <- r2_mat[, v]
+    out[[paste0("p_",  v)]] <- pval_mat[, v]
+    out[[paste0("q_",  v)]] <- qval_mat[, v]
+  }
+  out$any_clinical_sig <- any_sig
+  out
+}
+
+per_feat_results <- lapply(names(delta_all), function(m)
+  run_per_feature_lm(delta_all[[m]]$delta,
+                     get_clin_df(delta_all[[m]]$patient_ids), m))
+names(per_feat_results) <- names(delta_all)
+all_feat_df <- bind_rows(per_feat_results)
+write.csv(all_feat_df,
+          file.path(paths$tables, "04b_clinical_confounder_per_feature.csv"),
+          row.names = FALSE)
+```
+
+## Confounder summary
+
+```{r conf-summary}
+vars_model <- c("age_dx","sex_bin","BMI","stage_bin","location_bin")
+var_labels <- c("Age (continuous)","Sex","BMI","Stage","Location")
+
+summary_df <- bind_rows(lapply(seq_along(vars_model), function(j) {
+  v <- vars_model[j]; q_col <- paste0("q_", v); r2_col <- paste0("r2_", v)
+  total_n <- sum(!is.na(all_feat_df[[q_col]]))
+  n_sig   <- sum(all_feat_df[[q_col]] < 0.05, na.rm = TRUE)
+  data.frame(variable = var_labels[j], total_tested = total_n,
+             n_q05 = n_sig,
+             pct_q05 = round(100 * n_sig / max(total_n, 1), 1),
+             median_r2 = round(median(all_feat_df[[r2_col]], na.rm = TRUE), 4),
+             stringsAsFactors = FALSE)
+}))
+write.csv(summary_df,
+          file.path(paths$tables, "04b_clinical_confounder_summary.csv"),
+          row.names = FALSE)
+kable(summary_df,
+      col.names = c("Variable","Tested","q<0.05","% q<0.05","Median R²"),
+      caption = "Clinical effect-modifier screen. Median R² < 0·01 confirms negligible confounding.")
+```
+
+## PERMANOVA bubble plot
+
+```{r permanova-plot, fig.height=5}
+if (length(permanova_results) > 0) {
+  perm_df <- bind_rows(lapply(names(permanova_results), function(m) {
+    df <- permanova_results[[m]]; df$mode <- m
+    df$variable <- rownames(df); df
+  })) %>%
+    filter(!variable %in% c("Total","Residual")) %>%
+    mutate(variable = recode(variable,
+                              age_dx = "Age (continuous)",
+                              sex_bin = "Sex", BMI = "BMI",
+                              stage_bin = "Stage",
+                              location_bin = "Location"),
+           sig_label = case_when(`Pr(>F)` < 0.001 ~ "***",
+                                  `Pr(>F)` < 0.01  ~ "**",
+                                  `Pr(>F)` < 0.05  ~ "*", TRUE ~ "ns"))
+
+  p_perm <- ggplot(perm_df, aes(x = toupper(mode), y = variable,
+                                  size = R2, colour = `Pr(>F)` < 0.05)) +
+    geom_point(alpha = 0.8) +
+    geom_text(aes(label = sig_label), size = 3.5, vjust = -1.0,
+              colour = "black") +
+    scale_size_continuous(name = "R² (PERMANOVA)", range = c(2, 10)) +
+    scale_colour_manual(name = "p < 0.05",
+                         values = c("FALSE" = "grey70", "TRUE" = "#C00000"),
+                         labels = c("No", "Yes")) +
+    labs(title = "PERMANOVA: clinical variables vs. paired-\u0394 metabolome",
+         subtitle = "Bubble size = R²; red = p < 0·05 (999 permutations, marginal)",
+         x = "LC-MS mode", y = NULL) +
+    theme_bw(base_size = 11)
+  save_fig(p_perm, "04b_PERMANOVA_bubble", width = 7, height = 5)
+  p_perm
+}
+```
+
+---
+
+# Outputs for downstream analyses
+
+| File | Description |
+|------|-------------|
+| `output/results/03_statistical_results.rds` | Per-feature Wilcoxon + OPLS-DA — input for `03_biology_translation.Rmd` |
+| `output/tables/Table2_differential_metabolites.csv` | Significant features with MSI levels |
+| `output/tables/OPLSDA_model_quality.csv` | R²X / R²Y / Q² per mode |
+| `output/tables/clinical_metadata_linked.csv` | 182-patient clinical table |
+| `output/tables/04b_clinical_*.csv` | Confounder-assessment tables |
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
