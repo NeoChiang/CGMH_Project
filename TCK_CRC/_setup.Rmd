@@ -12,7 +12,7 @@
 #             <base_dir>/output/  (will be created automatically)
 #
 if (!exists("base_dir")) {
-  base_dir <- "/home/user/CGMH_Project"
+  base_dir <- "E:\_Service project\TCK"
 }
 
 paths <- list(
